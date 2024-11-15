@@ -5,9 +5,11 @@ use std::{
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket};
+
+#[cfg(target_os = "windows")]
 use tun::AbstractDevice;
 
-use crate::{ config, ip};
+use crate::{ config, ip, MTU};
 
 
 fn prefix2mask(prefix: u8) -> Ipv4Addr {
@@ -109,7 +111,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
         .tun_name(&cfg.tun.name)
         .address(tun_ip)
         .netmask(prefix2mask(prefix))
-        .mtu(tun::DEFAULT_MTU)
+        .mtu(MTU as u16)
         .up();
 
     #[cfg(target_os = "linux")]
@@ -152,8 +154,6 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
         }
     }
-
-    let size = dev.mtu().unwrap() as usize + tun::PACKET_INFORMATION_LENGTH;
     let (mut rdev, mut wdev) = tokio::io::split(dev);
 
     let soc = Arc::new(soc);
@@ -161,7 +161,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let _soc = soc.clone();
     let mut _cipher = cipher.clone();
     let _ = tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(size);
+        let mut buf = Vec::with_capacity(4096);
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
                 buf.set_len(0);
@@ -185,7 +185,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
         }
     });
     let _ = tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(size);
+        let mut buf = Vec::with_capacity(4096);
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
                 buf.set_len(0);

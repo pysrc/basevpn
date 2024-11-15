@@ -37,6 +37,8 @@ struct Args {
     config: String,
 }
 
+const MTU: usize = 1400;
+
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(log::Level::Info).unwrap();
@@ -62,12 +64,11 @@ async fn main() {
     let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
     let tun_ip = IpAddr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
     let mut config = tun::Configuration::default();
-    let mtu = tun::DEFAULT_MTU;
     config
         .tun_name(&cfg.tun.name)
         .address(tun_ip)
         .netmask(prefix2mask(prefix))
-        .mtu(mtu)
+        .mtu(MTU as u16)
         .up();
 
     #[cfg(target_os = "linux")]
@@ -92,7 +93,7 @@ async fn main() {
     tokio::task::spawn(async move {
         // 虚拟网卡读
         loop {
-            let mut buf = BytesMut::with_capacity(2000);
+            let mut buf = BytesMut::with_capacity(MTU);
             rdev.read_buf(&mut buf).await.unwrap();
             let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
