@@ -1,5 +1,6 @@
-use std::{collections::{HashMap, VecDeque}, fs::File, io::Write, net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::Arc};
+use std::{collections::HashMap, fs::File, io::Write, net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::Arc};
 
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, Mutex, RwLock}, time};
 
@@ -11,67 +12,6 @@ mod forward;
 mod ip;
 
 static mut NONCE: String = String::new();
-
-#[derive(Clone)]
-struct VecPool {
-    vec_pool: Arc<Mutex<VecDeque<Vec<u8>>>>
-}
-
-impl VecPool {
-    pub fn new(size: usize) -> Self {
-        let mut _inner = VecDeque::<Vec<u8>>::with_capacity(size);
-        for _ in 0..size {
-            _inner.push_back(Vec::with_capacity(100));
-        }
-        VecPool {
-            vec_pool: Arc::new(Mutex::new(_inner))
-        }
-    }
-    pub async fn pop(&mut self, size: usize) -> Vec<u8> {
-        let mut t = self.vec_pool.lock().await;
-        let v = t.pop_back();
-        match v {
-            Some(mut d) => {
-                d.resize(size, 0);
-                return d;
-            }
-            None => {
-                let mut d = Vec::with_capacity(size);
-                unsafe {
-                    d.set_len(size);
-                }
-                return d;
-            }
-        }
-    }
-    pub async fn pop_without_size(&mut self) -> Vec<u8> {
-        let mut t = self.vec_pool.lock().await;
-        let v = t.pop_back();
-        match v {
-            Some(mut d) => {
-                unsafe {
-                    d.set_len(0);
-                }
-                return d;
-            }
-            None => {
-                let d = Vec::new();
-                return d;
-            }
-        }
-    }
-    pub async fn back(&mut self, mut data: Vec<u8>) {
-        if self.vec_pool.lock().await.len() > 200 {
-            log::info!("vec pool more than 200.");
-            return;
-        }
-        unsafe {
-            data.set_len(0);
-        }
-        let mut t = self.vec_pool.lock().await;
-        t.push_back(data);
-    }
-}
 
 fn prefix2mask(prefix: u8) -> Ipv4Addr {
     // 确保 prefix 在 0 到 32 的范围内
@@ -117,9 +57,6 @@ async fn main() {
         }
     }
 
-    // 全局数据包池
-    let pool = VecPool::new(10);
-
     // 处理tun设备
     let ipp: Vec<&str> =  cfg.tun.ip.split('/').collect();
     let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
@@ -143,64 +80,53 @@ async fn main() {
     let (mut rdev, mut wdev) = tokio::io::split(dev);
 
     // 主通道
-    let (main_sender, mut main_receiver) = mpsc::channel::<Vec<u8>>(100);
+    let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
-    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, mpsc::Sender<Vec<u8>>>::new()));
+    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, mpsc::Sender<Bytes>>::new()));
     let source_packet_record = Arc::new(Mutex::new(HashMap::<IpAddr, time::Instant>::new()));
     // 真实地址跟虚拟地址对照表
     let r2vmap = Arc::new(RwLock::new(HashMap::<SocketAddr, IpAddr>::new()));
 
 
     let _customer_sender_map = customer_sender_map.clone();
-    let mut _pool = pool.clone();
     tokio::task::spawn(async move {
         // 虚拟网卡读
         loop {
-            let mut buf = _pool.pop(mtu as usize).await;
-            let len = rdev.read(&mut buf).await.unwrap();
-            unsafe {
-                buf.set_len(len);
-            }
+            let mut buf = BytesMut::with_capacity(2000);
+            rdev.read_buf(&mut buf).await.unwrap();
             let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
                     if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
                     {
-                        _pool.back(buf).await;
                         continue;
                     }
                     (IpAddr::V4(src), IpAddr::V4(dst))
                 }
                 _ => {
-                    _pool.back(buf).await;
                     continue;
                 }
             };
             // 转发到对应的目的地
             let mut m = _customer_sender_map.write().await;
             if let Some(s) = m.get_mut(&dst) {
-                match s.try_send(buf) {
+                match s.try_send(buf.freeze()) {
                     Ok(()) => {
 
                     }
-                    Err(TrySendError::Closed(message)) => {
+                    Err(TrySendError::Closed(_)) => {
                         // 通道关闭
                         log::info!("{} channel closed.", line!());
                         _ = m.remove(&dst);
-                        _pool.back(message).await;
                     }
-                    Err(TrySendError::Full(message)) => {
+                    Err(TrySendError::Full(_)) => {
                         // 队列满了，直接丢弃
                         log::info!("{} channel full.", line!());
-                        _pool.back(message).await;
                     }
                 }
-            } else {
-                _pool.back(buf).await;
             }
         }
     });
-    let mut _pool = pool.clone();
     let _customer_sender_map = customer_sender_map.clone();
     let _source_packet_record = source_packet_record.clone();
     tokio::spawn(async move {
@@ -213,7 +139,6 @@ async fn main() {
                     (IpAddr::V4(src), IpAddr::V4(dst))
                 }
                 _ => {
-                    _pool.back(buf).await;
                     continue;
                 }
             };
@@ -224,22 +149,19 @@ async fn main() {
                 // 转发给其他客户端
                 match s.try_send(buf) {
                     Ok(()) => {}
-                    Err(TrySendError::Closed(message)) => {
+                    Err(TrySendError::Closed(_)) => {
                         // 通道关闭
                         log::info!("{} channel closed.", line!());
                         _ = m.remove(&dst);
-                        _pool.back(message).await;
                     }
-                    Err(TrySendError::Full(message)) => {
+                    Err(TrySendError::Full(_)) => {
                         // 队列满了，直接丢弃
                         log::info!("{} channel full.", line!());
-                        _pool.back(message).await;
                     }
                 }
             } else {
                 wdev.write_all(&buf).await.unwrap();
                 wdev.flush().await.unwrap();
-                _pool.back(buf).await;
             }
 
         }
@@ -266,7 +188,6 @@ async fn main() {
     let cfg1 = cfg.clone();
     let _main_sender = main_sender.clone();
     let _customer_sender_map = customer_sender_map.clone();
-    let _pool = pool.clone();
     let _r2vmap = r2vmap.clone();
     tokio::spawn(async move {
         let mut dly = delay::Delay::new();
@@ -283,12 +204,11 @@ async fn main() {
                     let cfgc = cfg1.clone();
                     let __main_sender = _main_sender.clone();
                     let __customer_sender_map = _customer_sender_map.clone();
-                    let __pool = _pool.clone();
                     let __r2vmap = _r2vmap.clone();
                     tokio::spawn(async move {
                         match peer_info {
                             Some((_bind, _)) => {
-                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __r2vmap, __pool).await;
+                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __r2vmap).await;
                             }
                             None => {
                                 log::info!("RELAY DOWN.");
@@ -312,8 +232,7 @@ async fn main() {
                 log::info!("start direct mode.");
                 let _main_sender = main_sender.clone();
                 let _customer_sender_map = customer_sender_map.clone();
-                let _pool = pool.clone();
-                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, r2vmap, _pool).await;
+                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, r2vmap).await;
             }
             None => {
                 log::info!("no direct config");

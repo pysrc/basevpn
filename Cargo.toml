@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4.5.17", features = ["derive"] }
 tun = { version = "0.7", features = ["async"] }
 chacha20poly1305 = "0.10.1"
+bytes = "1"
 
 [profile.release]
 opt-level = "z"

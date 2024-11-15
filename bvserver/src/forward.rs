@@ -1,11 +1,12 @@
 use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
+use bytes::{Bytes, BytesMut};
 use tokio::{net::UdpSocket, sync::{mpsc::{self, error::TrySendError}, RwLock}};
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
 
-use crate::{config::Config, ip, VecPool, NONCE};
+use crate::{config::Config, ip, NONCE};
 
 /**
  * bind: 绑定地址
@@ -17,10 +18,9 @@ pub async fn forever(
     bind: SocketAddr, 
     cfg: Config,
     onece: bool, 
-    main_sender: mpsc::Sender<Vec<u8>>, 
-    customer_sender_map: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<Vec<u8>>>>>,
+    main_sender: mpsc::Sender<Bytes>, 
+    customer_sender_map: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<Bytes>>>>,
     r2vmap: Arc<RwLock<HashMap<SocketAddr, IpAddr>>>,
-    mut pool: VecPool,
 ) {
     let running = Arc::new(AtomicBool::new(true));
     // 1. 初始化密钥和 nonce（随机数）
@@ -35,7 +35,7 @@ pub async fn forever(
     let soc = UdpSocket::bind(bind).await.unwrap();
     let soc = Arc::new(soc);
     while running.load(Ordering::Relaxed) {
-        let mut buf = pool.pop_without_size().await;
+        let mut buf = BytesMut::with_capacity(2000);
         let (_, addr) = match soc.recv_buf_from(&mut buf).await {
             Ok(x) => x,
             Err(e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {
@@ -48,10 +48,11 @@ pub async fn forever(
                 continue;
             }
         };
-        if let Err(_) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
-            pool.back(buf).await;
+        let mut vbuf = buf.to_vec();
+        if let Err(_) = cipher.decrypt_in_place(nonce, b"", &mut vbuf) {
             continue;
         }
+        let buf = Bytes::from(vbuf);
         // 接收客户端数据包
         // 检查源地址是否存
         let (src, _) = match ip::version(&buf) {
@@ -59,7 +60,6 @@ pub async fn forever(
                 (IpAddr::V4(src), IpAddr::V4(dst))
             }
             _ => {
-                pool.back(buf).await;
                 continue;
             }
         };
@@ -67,7 +67,7 @@ pub async fn forever(
         if !r2vmap.read().await.contains_key(&addr) || !customer_sender_map.read().await.contains_key(&src) {
             // 新客户端接入
             log::info!("client ip is: {}", src);
-            let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(100);
+            let (sender, mut receiver) = mpsc::channel::<Bytes>(100);
             let old = customer_sender_map.write().await.insert(src, sender);
             if let Some(_old) = old {
                 log::info!("{} break old client {}", line!(), src);
@@ -77,13 +77,12 @@ pub async fn forever(
             r2vmap.write().await.insert(addr, src);
             let _customer_sender_map = customer_sender_map.clone();
             let _soc = soc.clone();
-            let mut _pool = pool.clone();
             let mut _cipher = cipher.clone();
             let mut _running = running.clone();
             tokio::spawn(async move {
                 // 接收tun设备的数据包
                 loop {
-                    let mut buf = match receiver.recv().await {
+                    let buf = match receiver.recv().await {
                         Some(_buf) => _buf,
                         None => {
                             log::info!("{} close stream.", line!());
@@ -93,31 +92,29 @@ pub async fn forever(
                             return;
                         }
                     };
-                    _cipher.encrypt_in_place(nonce, b"", &mut buf).unwrap();
-                    // log::info!("{}: {}->{}", line!(), _soc.local_addr().unwrap(), addr);
-                    if let Err(_) = _soc.send_to(&buf, addr).await {
+                    let mut vbuf = buf.to_vec();
+                    _cipher.encrypt_in_place(nonce, b"", &mut vbuf).unwrap();
+                    let vb = Bytes::from(vbuf);
+                    if let Err(_) = _soc.send_to(&vb, addr).await {
                         log::info!("{} close stream.", line!());
                         if onece {
                             _running.store(false, Ordering::Relaxed);
                         }
                         return;
                     }
-                    _pool.back(buf).await;
                 }
             });
         }
         match main_sender.try_send(buf) {
             Ok(()) => {}
-            Err(TrySendError::Closed(message)) => {
+            Err(TrySendError::Closed(_)) => {
                 // 主通道关闭
                 log::info!("{} channel closed.", line!());
-                pool.back(message).await;
                 return;
             }
-            Err(TrySendError::Full(message)) => {
+            Err(TrySendError::Full(_)) => {
                 // 队列满了，直接丢弃
                 log::info!("{} channel full.", line!());
-                pool.back(message).await;
             }
         }
     }
