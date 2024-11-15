@@ -1,0 +1,9 @@
+# bind端口
+bind: 0.0.0.0:12814
+# 通信数据校验盐
+salt: xxxxx
+# p2p打洞不成功时是否允许中继
+allow-relay: true
+# 允许的group-id
+allow-group-id:
+  - 8888888888888

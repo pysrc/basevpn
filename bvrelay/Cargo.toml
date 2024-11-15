@@ -1,0 +1,12 @@
+[package]
+name = "bvrelay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = { workspace = true }
+simple_logger = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+sha1 = { workspace = true }
+clap = { workspace = true }
