@@ -1,7 +1,7 @@
-use std::{collections::{HashMap, VecDeque}, fs::File, io::Write, net::{Ipv4Addr, SocketAddr}, str::FromStr, sync::Arc};
+use std::{collections::{HashMap, VecDeque}, fs::File, io::Write, net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::Arc};
 
 use clap::Parser;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, Mutex, RwLock}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, Mutex, RwLock}, time};
 
 mod config;
 mod delay;
@@ -123,7 +123,7 @@ async fn main() {
     // 处理tun设备
     let ipp: Vec<&str> =  cfg.tun.ip.split('/').collect();
     let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
-    let tun_ip: Ipv4Addr = Ipv4Addr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
+    let tun_ip = IpAddr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
     let mut config = tun::Configuration::default();
     let mtu = tun::DEFAULT_MTU;
     config
@@ -145,7 +145,12 @@ async fn main() {
     // 主通道
     let (main_sender, mut main_receiver) = mpsc::channel::<Vec<u8>>(100);
     // 客户端通道
-    let customer_sender_map = Arc::new(RwLock::new(HashMap::<Ipv4Addr, mpsc::Sender<Vec<u8>>>::new()));
+    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, mpsc::Sender<Vec<u8>>>::new()));
+    let source_packet_record = Arc::new(Mutex::new(HashMap::<IpAddr, time::Instant>::new()));
+    // 真实地址跟虚拟地址对照表
+    let r2vmap = Arc::new(RwLock::new(HashMap::<SocketAddr, IpAddr>::new()));
+
+
     let _customer_sender_map = customer_sender_map.clone();
     let mut _pool = pool.clone();
     tokio::task::spawn(async move {
@@ -156,84 +161,105 @@ async fn main() {
             unsafe {
                 buf.set_len(len);
             }
-            // 转发到对应的目的地
-            match ip::version(&buf) {
-                ip::Version::V4 => {
-                    let dst = ip::destination4(&buf);
+            let (_, dst) = match ip::version(&buf) {
+                ip::Version::V4(src, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
                     if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
                     {
                         _pool.back(buf).await;
                         continue;
                     }
-                    let mut m = _customer_sender_map.write().await;
-                    if let Some(s) = m.get_mut(&dst) {
-                        match s.try_send(buf) {
-                            Ok(()) => {
-
-                            }
-                            Err(TrySendError::Closed(message)) => {
-                                // 通道关闭
-                                log::info!("{} channel closed.", line!());
-                                _ = m.remove(&dst);
-                                _pool.back(message).await;
-                            }
-                            Err(TrySendError::Full(message)) => {
-                                // 队列满了，直接丢弃
-                                log::info!("{} channel full.", line!());
-                                _pool.back(message).await;
-                            }
-                        }
-                    } else {
-                        _pool.back(buf).await;
-                    }
+                    (IpAddr::V4(src), IpAddr::V4(dst))
                 }
                 _ => {
                     _pool.back(buf).await;
+                    continue;
                 }
+            };
+            // 转发到对应的目的地
+            let mut m = _customer_sender_map.write().await;
+            if let Some(s) = m.get_mut(&dst) {
+                match s.try_send(buf) {
+                    Ok(()) => {
+
+                    }
+                    Err(TrySendError::Closed(message)) => {
+                        // 通道关闭
+                        log::info!("{} channel closed.", line!());
+                        _ = m.remove(&dst);
+                        _pool.back(message).await;
+                    }
+                    Err(TrySendError::Full(message)) => {
+                        // 队列满了，直接丢弃
+                        log::info!("{} channel full.", line!());
+                        _pool.back(message).await;
+                    }
+                }
+            } else {
+                _pool.back(buf).await;
             }
         }
     });
     let mut _pool = pool.clone();
     let _customer_sender_map = customer_sender_map.clone();
+    let _source_packet_record = source_packet_record.clone();
     tokio::spawn(async move {
         // 虚拟网卡写
         loop {
             let buf = main_receiver.recv().await.unwrap();
             // 目的地是否其他客户端
-            match ip::version(&buf) {
-                ip::Version::V4 => {
-                    let dst = ip::destination4(&buf);
-                    let mut m = _customer_sender_map.write().await;
-                    if let Some(s) = m.get_mut(&dst) {
-                        // 转发给其他客户端
-                        match s.try_send(buf) {
-                            Ok(()) => {}
-                            Err(TrySendError::Closed(message)) => {
-                                // 通道关闭
-                                log::info!("{} channel closed.", line!());
-                                _ = m.remove(&dst);
-                                _pool.back(message).await;
-                            }
-                            Err(TrySendError::Full(message)) => {
-                                // 队列满了，直接丢弃
-                                log::info!("{} channel full.", line!());
-                                _pool.back(message).await;
-                            }
-                        }
-                    } else {
-                        wdev.write_all(&buf).await.unwrap();
-                        wdev.flush().await.unwrap();
-                        _pool.back(buf).await;
-                    }
+            let (src, dst) = match ip::version(&buf) {
+                ip::Version::V4(src, dst) => {
+                    (IpAddr::V4(src), IpAddr::V4(dst))
                 }
                 _ => {
                     _pool.back(buf).await;
+                    continue;
                 }
+            };
+            // log::info!("to pack {}, {}", src, buf.len());
+            _source_packet_record.lock().await.insert(src, time::Instant::now());
+            let mut m = _customer_sender_map.write().await;
+            if let Some(s) = m.get_mut(&dst) {
+                // 转发给其他客户端
+                match s.try_send(buf) {
+                    Ok(()) => {}
+                    Err(TrySendError::Closed(message)) => {
+                        // 通道关闭
+                        log::info!("{} channel closed.", line!());
+                        _ = m.remove(&dst);
+                        _pool.back(message).await;
+                    }
+                    Err(TrySendError::Full(message)) => {
+                        // 队列满了，直接丢弃
+                        log::info!("{} channel full.", line!());
+                        _pool.back(message).await;
+                    }
+                }
+            } else {
+                wdev.write_all(&buf).await.unwrap();
+                wdev.flush().await.unwrap();
+                _pool.back(buf).await;
             }
 
         }
     });
+
+    let _customer_sender_map = customer_sender_map.clone();
+    let _r2vmap = r2vmap.clone();
+    tokio::spawn(async move {
+        // 检查源ip是否10分钟内没来数据了，是的话剔除会话列表
+        loop {
+            time::sleep(time::Duration::from_secs(60 * 10)).await;
+            let _now = time::Instant::now();
+            let mut spr = source_packet_record.lock().await;
+            spr.retain(|_, v| _now.duration_since(*v).as_secs() < 600);
+            _customer_sender_map.write().await.retain(|k, _| spr.contains_key(k));
+            _r2vmap.write().await.retain(|_, v| spr.contains_key(v));
+            log::info!("check retain client {}", _customer_sender_map.read().await.len());
+        }
+    });
+
 
     // 中继模式
     let rcfg = cfg.relay_config.clone();
@@ -241,6 +267,7 @@ async fn main() {
     let _main_sender = main_sender.clone();
     let _customer_sender_map = customer_sender_map.clone();
     let _pool = pool.clone();
+    let _r2vmap = r2vmap.clone();
     tokio::spawn(async move {
         let mut dly = delay::Delay::new();
         match rcfg {
@@ -257,10 +284,11 @@ async fn main() {
                     let __main_sender = _main_sender.clone();
                     let __customer_sender_map = _customer_sender_map.clone();
                     let __pool = _pool.clone();
+                    let __r2vmap = _r2vmap.clone();
                     tokio::spawn(async move {
                         match peer_info {
                             Some((_bind, _)) => {
-                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __pool).await;
+                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __r2vmap, __pool).await;
                             }
                             None => {
                                 log::info!("RELAY DOWN.");
@@ -285,7 +313,7 @@ async fn main() {
                 let _main_sender = main_sender.clone();
                 let _customer_sender_map = customer_sender_map.clone();
                 let _pool = pool.clone();
-                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, _pool).await;
+                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, r2vmap, _pool).await;
             }
             None => {
                 log::info!("no direct config");

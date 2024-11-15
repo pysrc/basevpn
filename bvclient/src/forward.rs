@@ -4,7 +4,7 @@ use std::{
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, time::{self, timeout}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket};
 use tun::AbstractDevice;
 
 use crate::{ config, ip};
@@ -98,7 +98,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
 
     let soc = UdpSocket::bind(bind).await.unwrap();
     soc.connect(peer).await.unwrap();
-
+    log::info!("local and remote: {} -> {}", soc.local_addr().unwrap(), peer);
     // 处理tun设备
     log::info!("ip address is {}", cfg.tun.ip);
     let ipp: Vec<&str> =  cfg.tun.ip.split('/').collect();
@@ -156,69 +156,11 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let size = dev.mtu().unwrap() as usize + tun::PACKET_INFORMATION_LENGTH;
     let (mut rdev, mut wdev) = tokio::io::split(dev);
 
-    // 同步本机信息ip
-    let mut _buf = Vec::with_capacity(4);
-    _buf.extend_from_slice(&tun_ip.octets());
-    _buf.push(1);
-    cipher.encrypt_in_place(nonce, b"", &mut _buf).unwrap();
-    soc.send(&_buf).await.unwrap();
-    // 接收响应信息
-    let mut rbuf = Vec::new();
-    let mut i = 0;
-    while  i < 10 {
-        rbuf.clear();
-        match timeout(time::Duration::from_secs(1), soc.recv_buf(&mut rbuf)).await {
-            Ok(_res) => {
-                if let Err(e) = _res {
-                    log::error!("{}->{}", line!(), e);
-                    i += 1;
-                    soc.send(&_buf).await.unwrap();
-                    time::sleep(time::Duration::from_secs(1)).await;
-                } else {
-                    // 获取到服务器响应
-                    match cipher.decrypt_in_place(nonce, b"", &mut rbuf) {
-                        Ok(()) => {
-                            if rbuf.last() == Some(&1) {
-                                // 成功
-                                unsafe {
-                                    rbuf.set_len(rbuf.len() - 1);
-                                }
-                                log::info!("{}", String::from_utf8_lossy(&rbuf));
-                                break;
-                            } else {
-                                log::info!("server back fail.");
-                                unsafe {
-                                    rbuf.set_len(rbuf.len() - 1);
-                                }
-                                log::info!("{}", String::from_utf8_lossy(&rbuf));
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("{}->{}", line!(), e);
-                            i += 1;
-                            soc.send(&_buf).await.unwrap();
-                            time::sleep(time::Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("{}->{}", line!(), e);
-                soc.send(&_buf).await.unwrap();
-                i += 1;
-                time::sleep(time::Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-
-
     let soc = Arc::new(soc);
 
     let _soc = soc.clone();
     let mut _cipher = cipher.clone();
-    let th1 = tokio::spawn(async move {
+    let _ = tokio::spawn(async move {
         let mut buf = Vec::with_capacity(size);
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
@@ -226,23 +168,23 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
             rdev.read_buf(&mut buf).await.unwrap();
             match ip::version(&buf) {
-                ip::Version::V4 => {
-                    let dst_addr = ip::destination4(&buf);
+                ip::Version::V4(_, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
-                    if (dst_addr.octets()[0] >= 224 && dst_addr.octets()[0] <= 239) || dst_addr.octets()[3] == 255
+                    if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
                     {
                         continue;
                     }
-                    buf.push(2);
-                    if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
-                        _soc.send(&buf).await.unwrap();
-                    }
                 }
-                _=>{}
+                _ => {
+                    continue;
+                }
+            };
+            if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
+                _soc.send(&buf).await.unwrap();
             }
         }
     });
-    let th2 = tokio::spawn(async move {
+    let _ = tokio::spawn(async move {
         let mut buf = Vec::with_capacity(size);
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
@@ -250,20 +192,15 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
             soc.recv_buf(&mut buf).await.unwrap();
             if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
-                if buf.last() == Some(&2) {
-                    unsafe {
-                        buf.set_len(buf.len() - 1);
-                    }
-                    wdev.write_all(&buf).await.unwrap();
-                }
+                wdev.write_all(&buf).await.unwrap();
             }
         }
         _ = wdev.shutdown().await;
     });
     log::info!("ctrl + c to stop.");
     _ = tokio::signal::ctrl_c().await;
-    log::info!("stopping.");
-    RUNNING.store(false, Ordering::Relaxed);
-    _ = th1.await;
-    _ = th2.await;
+    // log::info!("stopping.");
+    // RUNNING.store(false, Ordering::Relaxed);
+    // _ = th1.await;
+    // _ = th2.await;
 }
