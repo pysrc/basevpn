@@ -84,10 +84,6 @@ async fn main() {
     let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
     let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>)>::new()));
-    // let source_packet_record = Arc::new(Mutex::new(HashMap::<IpAddr, time::Instant>::new()));
-    // 真实地址跟虚拟地址对照表
-    // let r2vmap = Arc::new(RwLock::new(HashMap::<SocketAddr, IpAddr>::new()));
-
 
     let _customer_sender_map = customer_sender_map.clone();
     tokio::task::spawn(async move {
