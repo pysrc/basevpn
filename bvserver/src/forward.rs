@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
 use bytes::{Bytes, BytesMut};
-use tokio::{net::UdpSocket, sync::{mpsc::{self, error::TrySendError}, RwLock}};
+use tokio::{net::UdpSocket, sync::{mpsc::{self, error::TrySendError}, RwLock}, time::Instant};
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
@@ -10,8 +10,6 @@ use crate::{config::Config, ip, NONCE};
 
 /**
  * bind: 绑定地址
- * tls_key: tls密钥
- * tls_cert: tls公钥
  * onece: 是否一次性连接
  */
 pub async fn forever(
@@ -19,8 +17,7 @@ pub async fn forever(
     cfg: Config,
     onece: bool, 
     main_sender: mpsc::Sender<Bytes>, 
-    customer_sender_map: Arc<RwLock<HashMap<IpAddr, mpsc::Sender<Bytes>>>>,
-    r2vmap: Arc<RwLock<HashMap<SocketAddr, IpAddr>>>,
+    customer_sender_map: Arc<RwLock<HashMap<IpAddr, (SocketAddr, Instant, mpsc::Sender<Bytes>)>>>
 ) {
     let running = Arc::new(AtomicBool::new(true));
     // 1. 初始化密钥和 nonce（随机数）
@@ -63,19 +60,26 @@ pub async fn forever(
                 continue;
             }
         };
-        // 客户端地址是否存在
-        if !r2vmap.read().await.contains_key(&addr) || !customer_sender_map.read().await.contains_key(&src) {
+        let mut first = false;
+        match customer_sender_map.read().await.get(&src) {
+            Some((_addr, _, _)) => {
+                if *_addr != addr {
+                    first = true;
+                    log::info!("diff src[{}] address {} -> {}", src, *_addr, addr);
+                }
+            }
+            None => {
+                first = true;
+                log::info!("new src[{}] address {}", src, addr);
+            }
+        }
+        if first {
             // 新客户端接入
-            log::info!("client ip is: {}", src);
             let (sender, mut receiver) = mpsc::channel::<Bytes>(100);
-            let old = customer_sender_map.write().await.insert(src, sender);
-            if let Some(_old) = old {
+            let old = customer_sender_map.write().await.insert(src, (addr, Instant::now(), sender));
+            if let Some(_) = old {
                 log::info!("{} break old client {}", line!(), src);
             }
-            // 移除老的
-            r2vmap.write().await.retain(|_, v| v != &src);
-            r2vmap.write().await.insert(addr, src);
-            let _customer_sender_map = customer_sender_map.clone();
             let _soc = soc.clone();
             let mut _cipher = cipher.clone();
             let mut _running = running.clone();

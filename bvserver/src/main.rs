@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs::File, io::Write, net::{IpAddr, Ipv4Addr, Soc
 
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, Mutex, RwLock}, time};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, RwLock}, time};
 
 mod config;
 mod delay;
@@ -83,17 +83,17 @@ async fn main() {
     // 主通道
     let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
-    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, mpsc::Sender<Bytes>>::new()));
-    let source_packet_record = Arc::new(Mutex::new(HashMap::<IpAddr, time::Instant>::new()));
+    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>)>::new()));
+    // let source_packet_record = Arc::new(Mutex::new(HashMap::<IpAddr, time::Instant>::new()));
     // 真实地址跟虚拟地址对照表
-    let r2vmap = Arc::new(RwLock::new(HashMap::<SocketAddr, IpAddr>::new()));
+    // let r2vmap = Arc::new(RwLock::new(HashMap::<SocketAddr, IpAddr>::new()));
 
 
     let _customer_sender_map = customer_sender_map.clone();
     tokio::task::spawn(async move {
         // 虚拟网卡读
         loop {
-            let mut buf = BytesMut::with_capacity(MTU);
+            let mut buf = BytesMut::with_capacity(4096);
             rdev.read_buf(&mut buf).await.unwrap();
             let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
@@ -110,7 +110,7 @@ async fn main() {
             };
             // 转发到对应的目的地
             let mut m = _customer_sender_map.write().await;
-            if let Some(s) = m.get_mut(&dst) {
+            if let Some((_, _, s)) = m.get_mut(&dst) {
                 match s.try_send(buf.freeze()) {
                     Ok(()) => {
 
@@ -129,13 +129,12 @@ async fn main() {
         }
     });
     let _customer_sender_map = customer_sender_map.clone();
-    let _source_packet_record = source_packet_record.clone();
     tokio::spawn(async move {
         // 虚拟网卡写
         loop {
             let buf = main_receiver.recv().await.unwrap();
             // 目的地是否其他客户端
-            let (src, dst) = match ip::version(&buf) {
+            let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
                     (IpAddr::V4(src), IpAddr::V4(dst))
                 }
@@ -143,10 +142,9 @@ async fn main() {
                     continue;
                 }
             };
-            // log::info!("to pack {}, {}", src, buf.len());
-            _source_packet_record.lock().await.insert(src, time::Instant::now());
             let mut m = _customer_sender_map.write().await;
-            if let Some(s) = m.get_mut(&dst) {
+            if let Some((_, t, s)) = m.get_mut(&dst) {
+                *t = time::Instant::now();
                 // 转发给其他客户端
                 match s.try_send(buf) {
                     Ok(()) => {}
@@ -169,16 +167,12 @@ async fn main() {
     });
 
     let _customer_sender_map = customer_sender_map.clone();
-    let _r2vmap = r2vmap.clone();
     tokio::spawn(async move {
         // 检查源ip是否10分钟内没来数据了，是的话剔除会话列表
         loop {
             time::sleep(time::Duration::from_secs(60 * 10)).await;
             let _now = time::Instant::now();
-            let mut spr = source_packet_record.lock().await;
-            spr.retain(|_, v| _now.duration_since(*v).as_secs() < 600);
-            _customer_sender_map.write().await.retain(|k, _| spr.contains_key(k));
-            _r2vmap.write().await.retain(|_, v| spr.contains_key(v));
+            _customer_sender_map.write().await.retain(|_, (_, t, _) | _now.duration_since(*t).as_secs() < 600);
             log::info!("check retain client {}", _customer_sender_map.read().await.len());
         }
     });
@@ -189,7 +183,7 @@ async fn main() {
     let cfg1 = cfg.clone();
     let _main_sender = main_sender.clone();
     let _customer_sender_map = customer_sender_map.clone();
-    let _r2vmap = r2vmap.clone();
+    // let _r2vmap = r2vmap.clone();
     tokio::spawn(async move {
         let mut dly = delay::Delay::new();
         match rcfg {
@@ -205,11 +199,10 @@ async fn main() {
                     let cfgc = cfg1.clone();
                     let __main_sender = _main_sender.clone();
                     let __customer_sender_map = _customer_sender_map.clone();
-                    let __r2vmap = _r2vmap.clone();
                     tokio::spawn(async move {
                         match peer_info {
                             Some((_bind, _)) => {
-                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __r2vmap).await;
+                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map).await;
                             }
                             None => {
                                 log::info!("RELAY DOWN.");
@@ -233,7 +226,7 @@ async fn main() {
                 log::info!("start direct mode.");
                 let _main_sender = main_sender.clone();
                 let _customer_sender_map = customer_sender_map.clone();
-                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, r2vmap).await;
+                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map).await;
             }
             None => {
                 log::info!("no direct config");
