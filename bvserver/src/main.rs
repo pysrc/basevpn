@@ -179,7 +179,6 @@ async fn main() {
     let cfg1 = cfg.clone();
     let _main_sender = main_sender.clone();
     let _customer_sender_map = customer_sender_map.clone();
-    // let _r2vmap = r2vmap.clone();
     tokio::spawn(async move {
         let mut dly = delay::Delay::new();
         match rcfg {
