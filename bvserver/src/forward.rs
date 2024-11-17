@@ -6,7 +6,7 @@ use tokio::{net::UdpSocket, sync::{mpsc::{self, error::TrySendError}, RwLock}, t
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
 
-use crate::{config::Config, ip, NONCE};
+use crate::{buffer::PBuffer, config::Config, ip, NONCE};
 
 /**
  * bind: 绑定地址
@@ -45,11 +45,11 @@ pub async fn forever(
                 continue;
             }
         };
-        let mut vbuf = buf.to_vec();
-        if let Err(_) = cipher.decrypt_in_place(nonce, b"", &mut vbuf) {
+        let mut pb = PBuffer::new(buf);
+        if let Err(_) = cipher.decrypt_in_place(nonce, b"", &mut pb) {
             continue;
         }
-        let buf = Bytes::from(vbuf);
+        buf = pb.into_buffer();
         // 接收客户端数据包
         // 检查源地址是否存
         let (src, _) = match ip::version(&buf) {
@@ -96,10 +96,11 @@ pub async fn forever(
                             return;
                         }
                     };
-                    let mut vbuf = buf.to_vec();
-                    _cipher.encrypt_in_place(nonce, b"", &mut vbuf).unwrap();
-                    let vb = Bytes::from(vbuf);
-                    if let Err(_) = _soc.send_to(&vb, addr).await {
+                    let mbuf = buf.try_into_mut().unwrap();
+                    let mut pb = PBuffer::new(mbuf);
+                    _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
+                    let buf = pb.into_buffer();
+                    if let Err(_) = _soc.send_to(&buf, addr).await {
                         log::info!("{} close stream.", line!());
                         if onece {
                             _running.store(false, Ordering::Relaxed);
@@ -109,7 +110,7 @@ pub async fn forever(
                 }
             });
         }
-        match main_sender.try_send(buf) {
+        match main_sender.try_send(buf.freeze()) {
             Ok(()) => {}
             Err(TrySendError::Closed(_)) => {
                 // 主通道关闭

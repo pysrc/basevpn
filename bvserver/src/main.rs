@@ -10,6 +10,7 @@ mod p2p;
 mod netaddr;
 mod forward;
 mod ip;
+mod buffer;
 
 static mut NONCE: String = String::new();
 
@@ -89,7 +90,7 @@ async fn main() {
     tokio::task::spawn(async move {
         // 虚拟网卡读
         loop {
-            let mut buf = BytesMut::with_capacity(4096);
+            let mut buf = BytesMut::with_capacity(10240);
             rdev.read_buf(&mut buf).await.unwrap();
             let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {

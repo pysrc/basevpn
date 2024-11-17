@@ -161,7 +161,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let _soc = soc.clone();
     let mut _cipher = cipher.clone();
     let _ = tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(4096);
+        let mut buf = Vec::with_capacity(10240);
         while RUNNING.load(Ordering::Relaxed) {
             unsafe {
                 buf.set_len(0);
