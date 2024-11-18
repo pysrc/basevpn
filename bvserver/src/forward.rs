@@ -52,7 +52,7 @@ pub async fn forever(
         buf = pb.into_buffer();
         // 接收客户端数据包
         // 检查源地址是否存
-        let (src, _) = match ip::version(&buf) {
+        let (src, dst) = match ip::version(&buf) {
             ip::Version::V4(src, dst) => {
                 (IpAddr::V4(src), IpAddr::V4(dst))
             }
@@ -100,15 +100,35 @@ pub async fn forever(
                     let mut pb = PBuffer::new(mbuf);
                     _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
                     let buf = pb.into_buffer();
-                    if let Err(_) = _soc.send_to(&buf, addr).await {
-                        log::info!("{} close stream.", line!());
-                        if onece {
-                            _running.store(false, Ordering::Relaxed);
+                    match _soc.try_send_to(&buf, addr) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {
+                            // Writable false positive.
+                            log::info!("{} continue stream -> {}", line!(), e);
+                            continue;
                         }
-                        return;
+                        Err(e) => {
+                            log::info!("{} close stream -> {}", line!(), e);
+                            if onece {
+                                _running.store(false, Ordering::Relaxed);
+                            }
+                            return;
+                        }
                     }
                 }
             });
+        }
+        if dst.is_unspecified() {
+            // 心跳包
+            // 更新心跳时间
+            log::info!("hart [{}].", src);
+            match customer_sender_map.write().await.get_mut(&src) {
+                Some((_, _t, _)) => {
+                    *_t = Instant::now();
+                }
+                None => {}
+            }
+            continue;
         }
         match main_sender.try_send(buf.freeze()) {
             Ok(()) => {}

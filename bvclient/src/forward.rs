@@ -4,13 +4,12 @@ use std::{
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, time::{timeout, Instant}};
 
 #[cfg(target_os = "windows")]
 use tun::AbstractDevice;
 
 use crate::{ config, ip, MTU};
-
 
 fn prefix2mask(prefix: u8) -> Ipv4Addr {
     // 确保 prefix 在 0 到 32 的范围内
@@ -86,6 +85,8 @@ static mut NONCE: String = String::new();
 
 pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
 
+    let mut hart_buf = vec![64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
     // 1. 初始化密钥和 nonce（随机数）
     let _k = cfg.cipher_config.key.clone();
     unsafe {
@@ -106,6 +107,8 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let ipp: Vec<&str> =  cfg.tun.ip.split('/').collect();
     let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
     let tun_ip: Ipv4Addr = Ipv4Addr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
+    hart_buf[12..16].copy_from_slice(&tun_ip.octets());
+    log::info!("hart buf: {:?}", hart_buf);
     let mut config = tun::Configuration::default();
     config
         .tun_name(&cfg.tun.name)
@@ -159,28 +162,46 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let soc = Arc::new(soc);
 
     let _soc = soc.clone();
+    cipher.encrypt_in_place(nonce, b"", &mut hart_buf).unwrap();
     let mut _cipher = cipher.clone();
     let _ = tokio::spawn(async move {
+        // 发送一次心跳
+        _soc.send(&hart_buf).await.unwrap();
+        // 上次心跳时间
+        let mut last_hart = Instant::now();
         let mut buf = Vec::with_capacity(10240);
         while RUNNING.load(Ordering::Relaxed) {
+            let _now = Instant::now();
+            if _now.duration_since(last_hart).as_secs() > 60 {
+                // 发送心跳
+                last_hart = _now;
+                _soc.send(&hart_buf).await.unwrap();
+                log::info!("hart to server.");
+            }
             unsafe {
                 buf.set_len(0);
             }
-            rdev.read_buf(&mut buf).await.unwrap();
-            match ip::version(&buf) {
-                ip::Version::V4(_, dst) => {
-                    // 拒绝组播、多播udp，仅支持单播
-                    if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
-                    {
-                        continue;
+            match timeout(tokio::time::Duration::from_secs(1), rdev.read_buf(&mut buf)).await {
+                Ok(_readr) => {
+                    _readr.unwrap();
+                    match ip::version(&buf) {
+                        ip::Version::V4(_, dst) => {
+                            // 拒绝组播、多播udp，仅支持单播
+                            if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
+                            {
+                                continue;
+                            }
+                        }
+                        _ => {
+                            continue;
+                        }
+                    };
+                    if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
+                        _soc.send(&buf).await.unwrap();
                     }
                 }
-                _ => {
-                    continue;
+                Err(_) => {
                 }
-            };
-            if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
-                _soc.send(&buf).await.unwrap();
             }
         }
     });

@@ -140,8 +140,7 @@ async fn main() {
                 }
             };
             let mut m = _customer_sender_map.write().await;
-            if let Some((_, t, s)) = m.get_mut(&dst) {
-                *t = time::Instant::now();
+            if let Some((_, _, s)) = m.get(&dst) {
                 // 转发给其他客户端
                 match s.try_send(buf) {
                     Ok(()) => {}
