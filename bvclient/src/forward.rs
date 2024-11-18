@@ -237,7 +237,6 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
             soc.recv_buf(&mut buf).await.unwrap();
             if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
-                log::info!("recv buf {:?}", buf);
                 wdev.write_all(&buf).await.unwrap();
             }
         }

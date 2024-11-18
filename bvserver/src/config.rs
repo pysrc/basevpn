@@ -45,6 +45,8 @@ pub struct Config {
     pub tun: TunConfig,
     #[serde(rename = "in-routes")]
     pub in_routes: Option<Vec<String>>,
+    #[serde(rename = "out-routes")]
+    pub out_routes: Option<Vec<String>>,
     // 中继配置
     #[serde(rename = "relay-config")]
     pub relay_config: Option<RelayConfig>,

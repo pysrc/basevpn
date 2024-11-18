@@ -5,6 +5,7 @@ use clap::Parser;
 use config::MetaInfo;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, RwLock}, time};
 use treebitmap::IpLookupTable;
+use tun::AbstractDevice;
 
 mod config;
 mod delay;
@@ -150,6 +151,40 @@ async fn main() {
     }
 
     let dev = tun::create_as_async(&config).unwrap();
+
+    // 设置路由
+    #[cfg(target_os = "windows")]
+    {
+        let index = dev.tun_index().unwrap();
+        log::info!("tun index is {}", index);
+        if let Some(routes) = cfg.out_routes.clone() {
+            for mut route in routes {
+                route = route_with_mask(route);
+                let set_route = format!("netsh interface ip add route {} {}", route, index);
+                log::info!("{}", set_route);
+                std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg(set_route)
+                    .output()
+                    .unwrap();
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(routes) = cfg.routes.clone() {
+            for mut route in routes {
+                route = route_with_mask(route);
+                let set_route = format!("ip route add {} dev {}", route, &cfg.tun.name);
+                log::info!("{}", set_route);
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(set_route)
+                    .output()
+                    .unwrap();
+            }
+        }
+    }
     
     let (mut rdev, mut wdev) = tokio::io::split(dev);
 
@@ -164,7 +199,7 @@ async fn main() {
         loop {
             let mut buf = BytesMut::with_capacity(10240);
             rdev.read_buf(&mut buf).await.unwrap();
-            let (_, dst) = match ip::version(&buf) {
+            let (src, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
                     if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
@@ -177,6 +212,7 @@ async fn main() {
                     continue;
                 }
             };
+            log::info!("{}->{}", src, dst);
             // 转发到对应的目的地
             let mut m = _customer_sender_map.write().await;
             if let Some((_, _, s, _)) = m.get_mut(&dst) {
@@ -205,12 +241,12 @@ async fn main() {
             let buf = main_receiver.recv().await.unwrap();
             // 目的地是否其他客户端
             let dst = match ip::version(&buf) {
-                ip::Version::V4(src, dst) => {
+                ip::Version::V4(_, dst) => {
                     match _iptables.try_read() {
                         Ok(_iptables) => {
                             match _iptables.longest_match(dst) {
                                 Some((_, _, toaddr)) => {
-                                    log::info!("route {} to {} by {}", src, dst, toaddr);
+                                    // log::info!("route {} to {} by {}", src, dst, toaddr);
                                     IpAddr::V4(*toaddr)
                                 }
                                 None => {
@@ -243,7 +279,6 @@ async fn main() {
                     }
                 }
             } else {
-                log::info!("local.");
                 wdev.write_all(&buf).await.unwrap();
                 wdev.flush().await.unwrap();
             }

@@ -63,6 +63,7 @@ pub async fn forever(
             }
         };
         let mut first = false;
+        let mut _none = false;
         match customer_sender_map.read().await.get(&src) {
             Some((_addr, _, _, _)) => {
                 if *_addr != addr {
@@ -71,8 +72,32 @@ pub async fn forever(
                 }
             }
             None => {
-                first = true;
-                log::info!("new src[{}] address {}", src, addr);
+                _none = true;
+            }
+        }
+        if _none {
+            // 客户端nat回包
+            match customer_sender_map.write().await.get_mut(&dst) {
+                Some((_addr, t, s, _)) => {
+                    *t = Instant::now();
+                    match s.try_send(buf.freeze()) {
+                        Ok(()) => {}
+                        Err(TrySendError::Closed(_)) => {
+                            // 主通道关闭
+                            log::info!("{} channel closed.", line!());
+                            return;
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            // 队列满了，直接丢弃
+                            log::info!("{} channel full.", line!());
+                        }
+                    }
+                    continue;
+                }
+                None => {
+                    first = true;
+                    log::info!("{} new src[{}->{}] address {}", line!(), src, dst, addr);
+                }
             }
         }
         if first {
@@ -82,19 +107,23 @@ pub async fn forever(
             if buf.len() <= 20 {
                 continue;
             }
-            let meta_info: MetaInfo = serde_yaml::from_slice(&buf[20..]).unwrap();
-            log::info!("client meta info: {:?}", meta_info);
-            {
-                let mut m = iptables.write().await;
-                for (ip, masklen) in &meta_info.in_routes4 {
-                    if let IpAddr::V4(addr) = src {
-                        m.insert(*ip, *masklen as u32, addr);
+
+            if let Ok(meta_info) = serde_yaml::from_slice::<MetaInfo>(&buf[20..]) {
+                log::info!("client meta info: {:?}", meta_info);
+                {
+                    let mut m = iptables.write().await;
+                    for (ip, masklen) in &meta_info.in_routes4 {
+                        if let IpAddr::V4(addr) = src {
+                            m.insert(*ip, *masklen as u32, addr);
+                        }
                     }
                 }
-            }
-            let old = customer_sender_map.write().await.insert(src, (addr, Instant::now(), sender, meta_info));
-            if let Some(_) = old {
-                log::info!("{} break old client {}", line!(), src);
+                let old = customer_sender_map.write().await.insert(src, (addr, Instant::now(), sender, meta_info));
+                if let Some(_) = old {
+                    log::info!("{} break old client {}", line!(), src);
+                }
+            } else {
+                continue;
             }
             let _soc = soc.clone();
             let mut _cipher = cipher.clone();
