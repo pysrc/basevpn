@@ -1,12 +1,13 @@
-use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
 use bytes::{Bytes, BytesMut};
 use tokio::{net::UdpSocket, sync::{mpsc::{self, error::TrySendError}, RwLock}, time::Instant};
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use treebitmap::IpLookupTable; // 使用 ChaCha20-Poly1305 实现
 
-use crate::{buffer::PBuffer, config::Config, ip, NONCE};
+use crate::{buffer::PBuffer, config::{Config, MetaInfo}, ip, NONCE};
 
 /**
  * bind: 绑定地址
@@ -17,7 +18,8 @@ pub async fn forever(
     cfg: Config,
     onece: bool, 
     main_sender: mpsc::Sender<Bytes>, 
-    customer_sender_map: Arc<RwLock<HashMap<IpAddr, (SocketAddr, Instant, mpsc::Sender<Bytes>)>>>
+    customer_sender_map: Arc<RwLock<HashMap<IpAddr, (SocketAddr, Instant, mpsc::Sender<Bytes>, MetaInfo)>>>,
+    iptables: Arc<RwLock<IpLookupTable<Ipv4Addr, Ipv4Addr>>>,
 ) {
     let running = Arc::new(AtomicBool::new(true));
     // 1. 初始化密钥和 nonce（随机数）
@@ -62,7 +64,7 @@ pub async fn forever(
         };
         let mut first = false;
         match customer_sender_map.read().await.get(&src) {
-            Some((_addr, _, _)) => {
+            Some((_addr, _, _, _)) => {
                 if *_addr != addr {
                     first = true;
                     log::info!("diff src[{}] address {} -> {}", src, *_addr, addr);
@@ -76,7 +78,21 @@ pub async fn forever(
         if first {
             // 新客户端接入
             let (sender, mut receiver) = mpsc::channel::<Bytes>(100);
-            let old = customer_sender_map.write().await.insert(src, (addr, Instant::now(), sender));
+            // 读入cidr
+            if buf.len() <= 20 {
+                continue;
+            }
+            let meta_info: MetaInfo = serde_yaml::from_slice(&buf[20..]).unwrap();
+            log::info!("client meta info: {:?}", meta_info);
+            {
+                let mut m = iptables.write().await;
+                for (ip, masklen) in &meta_info.in_routes4 {
+                    if let IpAddr::V4(addr) = src {
+                        m.insert(*ip, *masklen as u32, addr);
+                    }
+                }
+            }
+            let old = customer_sender_map.write().await.insert(src, (addr, Instant::now(), sender, meta_info));
             if let Some(_) = old {
                 log::info!("{} break old client {}", line!(), src);
             }
@@ -123,7 +139,7 @@ pub async fn forever(
             // 更新心跳时间
             log::info!("hart [{}].", src);
             match customer_sender_map.write().await.get_mut(&src) {
-                Some((_, _t, _)) => {
+                Some((_, _t, _, _)) => {
                     *_t = Instant::now();
                 }
                 None => {}

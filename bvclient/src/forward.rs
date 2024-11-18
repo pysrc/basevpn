@@ -9,7 +9,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, time::{timeout, I
 #[cfg(target_os = "windows")]
 use tun::AbstractDevice;
 
-use crate::{ config, ip, MTU};
+use crate::{ config::{self, MetaInfo}, ip, MTU};
 
 fn prefix2mask(prefix: u8) -> Ipv4Addr {
     // 确保 prefix 在 0 到 32 的范围内
@@ -79,6 +79,14 @@ fn route_with_mask(route: String) -> String {
     return route;
 }
 
+
+fn split_addr(cidr: &str) -> (Ipv4Addr, u8) {
+    let ipp: Vec<&str> =  cidr.split('/').collect();
+    let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
+    let ip: Ipv4Addr = Ipv4Addr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
+    (ip, prefix)
+}
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 static mut NONCE: String = String::new();
@@ -104,9 +112,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     log::info!("local and remote: {} -> {}", soc.local_addr().unwrap(), peer);
     // 处理tun设备
     log::info!("ip address is {}", cfg.tun.ip);
-    let ipp: Vec<&str> =  cfg.tun.ip.split('/').collect();
-    let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
-    let tun_ip: Ipv4Addr = Ipv4Addr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
+    let (tun_ip, prefix) = split_addr(&cfg.tun.ip);
     hart_buf[12..16].copy_from_slice(&tun_ip.octets());
     log::info!("hart buf: {:?}", hart_buf);
     let mut config = tun::Configuration::default();
@@ -129,7 +135,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     {
         let index = dev.tun_index().unwrap();
         log::info!("tun index is {}", index);
-        if let Some(routes) = cfg.routes {
+        if let Some(routes) = cfg.out_routes {
             for mut route in routes {
                 route = route_with_mask(route);
                 let set_route = format!("netsh interface ip add route {} {}", route, index);
@@ -162,11 +168,29 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let soc = Arc::new(soc);
 
     let _soc = soc.clone();
+    // 第一次心跳包，带上本机的一些信息
+    let mut meta_hart = Vec::<u8>::new();
+    meta_hart.extend_from_slice(&hart_buf);
+
+    let mut in_routes = Vec::new();
+    // 放入本机的cidr
+    in_routes.push((tun_ip, prefix));
+    if let Some(routes) = cfg.in_routes {
+        for mut route in routes {
+            route = route_with_mask(route);
+            in_routes.push(split_addr(&route));
+        }
+    }
+    let mi: MetaInfo = MetaInfo{
+        in_routes4: in_routes,
+    };
+    serde_yaml::to_writer(&mut meta_hart, &mi).unwrap();
+
     cipher.encrypt_in_place(nonce, b"", &mut hart_buf).unwrap();
+    cipher.encrypt_in_place(nonce, b"", &mut meta_hart).unwrap();
     let mut _cipher = cipher.clone();
     let _ = tokio::spawn(async move {
-        // 发送一次心跳
-        _soc.send(&hart_buf).await.unwrap();
+        _soc.send(&meta_hart).await.unwrap();
         // 上次心跳时间
         let mut last_hart = Instant::now();
         let mut buf = Vec::with_capacity(10240);
@@ -213,6 +237,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
             soc.recv_buf(&mut buf).await.unwrap();
             if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
+                log::info!("recv buf {:?}", buf);
                 wdev.write_all(&buf).await.unwrap();
             }
         }

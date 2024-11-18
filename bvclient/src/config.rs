@@ -1,6 +1,19 @@
+use std::net::Ipv4Addr;
 use std::{fs::File, io::Read};
-
 use serde::{Deserialize, Serialize};
+
+
+/**
+ * 传输基础信息
+ */
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MetaInfo {
+    // 允许的入方向路由
+    pub in_routes4: Vec<(Ipv4Addr, u8)>
+}
+
+
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CipherConfig {
     pub key: String,
@@ -35,7 +48,10 @@ pub struct Config {
     pub relay_config: Option<RelayConfig>,
     #[serde(rename = "direct-config")]
     pub direct_config: Option<DirectConfig>,
-    pub routes: Option<Vec<String>>,
+    #[serde(rename = "in-routes")]
+    pub in_routes: Option<Vec<String>>,
+    #[serde(rename = "out-routes")]
+    pub out_routes: Option<Vec<String>>,
     pub tun: TunConfig,
 }
 

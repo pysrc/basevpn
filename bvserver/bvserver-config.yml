@@ -8,6 +8,10 @@ tun:
   ip: 10.28.13.1/24
   name: basevpn
 
+# 允许入方向的路由
+in-routes:
+  - 0.0.0.0/0
+
 # 当需要中继时需要配置
 relay-config:
   # 中继地址

@@ -2,7 +2,9 @@ use std::{collections::HashMap, fs::File, io::Write, net::{IpAddr, Ipv4Addr, Soc
 
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
+use config::MetaInfo;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, RwLock}, time};
+use treebitmap::IpLookupTable;
 
 mod config;
 mod delay;
@@ -13,6 +15,13 @@ mod ip;
 mod buffer;
 
 static mut NONCE: String = String::new();
+
+fn split_addr(cidr: &str) -> (Ipv4Addr, u8) {
+    let ipp: Vec<&str> =  cidr.split('/').collect();
+    let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
+    let ip: Ipv4Addr = Ipv4Addr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
+    (ip, prefix)
+}
 
 fn prefix2mask(prefix: u8) -> Ipv4Addr {
     // 确保 prefix 在 0 到 32 的范围内
@@ -27,6 +36,59 @@ fn prefix2mask(prefix: u8) -> Ipv4Addr {
 
     // 将 mask 转换为 IPv4 地址
     Ipv4Addr::from(mask)
+}
+
+fn binmatch(n: u8) -> Option<u8> {
+    match n {
+        0b0000_0000 => Some(0),
+        0b1000_0000 => Some(1),
+        0b1100_0000 => Some(2),
+        0b1110_0000 => Some(3),
+        0b1111_0000 => Some(4),
+        0b1111_1000 => Some(5),
+        0b1111_1100 => Some(6),
+        0b1111_1110 => Some(7),
+        0b1111_1111 => Some(8),
+        _ => None,
+    }
+}
+
+// 255.255.252.0 -> 22
+fn mask2prefix(mask: &str) -> u8 {
+    let sp: Vec<&str> = mask.split(".").collect();
+    let a: u8 = sp[0].parse().unwrap();
+    let b: u8 = sp[1].parse().unwrap();
+    let c: u8 = sp[2].parse().unwrap();
+    let d: u8 = sp[3].parse().unwrap();
+    let mut res = 0;
+    if let Some(k) = binmatch(a) {
+        res += k;
+    }
+    if let Some(k) = binmatch(b) {
+        res += k;
+    }
+    if let Some(k) = binmatch(c) {
+        res += k;
+    }
+    if let Some(k) = binmatch(d) {
+        res += k;
+    }
+    res
+}
+
+fn route_with_mask(route: String) -> String {
+    let mut route = route;
+    if !route.contains("/") {
+        route = route + "/32";
+    }
+    let rm: Vec<&str> = route.split("/").collect();
+    let mask = rm[1];
+    if mask.contains(".") {
+        // eg. 255.255.0.0
+        let prefix = mask2prefix(mask);
+        route = format!("{}/{}", rm[0], prefix);
+    }
+    return route;
 }
 
 /// Config
@@ -61,9 +123,7 @@ async fn main() {
     }
 
     // 处理tun设备
-    let ipp: Vec<&str> =  cfg.tun.ip.split('/').collect();
-    let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
-    let tun_ip = IpAddr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
+    let (tun_ip, prefix) = split_addr(& cfg.tun.ip);
     let mut config = tun::Configuration::default();
     config
         .tun_name(&cfg.tun.name)
@@ -76,6 +136,18 @@ async fn main() {
     config.platform_config(|config| {
         config.ensure_root_privileges(true);
     });
+ 
+    let iptables = Arc::new(RwLock::new(IpLookupTable::<Ipv4Addr, Ipv4Addr>::new()));
+    // 放入本机cidr
+    iptables.write().await.insert(tun_ip, prefix as u32, tun_ip);
+    // 放入本机允许cidr
+    if let Some(routes) = cfg.in_routes.clone() {
+        for mut route in routes {
+            route = route_with_mask(route);
+            let (ip, pfx) = split_addr(&route);
+            iptables.write().await.insert(ip, pfx as u32, tun_ip);
+        }
+    }
 
     let dev = tun::create_as_async(&config).unwrap();
     
@@ -84,7 +156,7 @@ async fn main() {
     // 主通道
     let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
-    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>)>::new()));
+    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>, MetaInfo)>::new()));
 
     let _customer_sender_map = customer_sender_map.clone();
     tokio::task::spawn(async move {
@@ -107,7 +179,7 @@ async fn main() {
             };
             // 转发到对应的目的地
             let mut m = _customer_sender_map.write().await;
-            if let Some((_, _, s)) = m.get_mut(&dst) {
+            if let Some((_, _, s, _)) = m.get_mut(&dst) {
                 match s.try_send(buf.freeze()) {
                     Ok(()) => {
 
@@ -126,28 +198,44 @@ async fn main() {
         }
     });
     let _customer_sender_map = customer_sender_map.clone();
+    let _iptables = iptables.clone();
     tokio::spawn(async move {
         // 虚拟网卡写
         loop {
             let buf = main_receiver.recv().await.unwrap();
             // 目的地是否其他客户端
-            let (_, dst) = match ip::version(&buf) {
+            let dst = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
-                    (IpAddr::V4(src), IpAddr::V4(dst))
+                    match _iptables.try_read() {
+                        Ok(_iptables) => {
+                            match _iptables.longest_match(dst) {
+                                Some((_, _, toaddr)) => {
+                                    log::info!("route {} to {} by {}", src, dst, toaddr);
+                                    IpAddr::V4(*toaddr)
+                                }
+                                None => {
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            continue;
+                        }
+                    }
                 }
                 _ => {
                     continue;
                 }
             };
-            let mut m = _customer_sender_map.write().await;
-            if let Some((_, _, s)) = m.get(&dst) {
+
+            let m = _customer_sender_map.read().await;
+            if let Some((_, _, s, _)) = m.get(&dst) {
                 // 转发给其他客户端
                 match s.try_send(buf) {
                     Ok(()) => {}
                     Err(TrySendError::Closed(_)) => {
                         // 通道关闭
                         log::info!("{} channel closed.", line!());
-                        _ = m.remove(&dst);
                     }
                     Err(TrySendError::Full(_)) => {
                         // 队列满了，直接丢弃
@@ -155,20 +243,35 @@ async fn main() {
                     }
                 }
             } else {
+                log::info!("local.");
                 wdev.write_all(&buf).await.unwrap();
                 wdev.flush().await.unwrap();
             }
+
 
         }
     });
 
     let _customer_sender_map = customer_sender_map.clone();
+    let _iptables = iptables.clone();
     tokio::spawn(async move {
         // 检查源ip是否10分钟内没来数据了，是的话剔除会话列表
         loop {
             time::sleep(time::Duration::from_secs(60 * 10)).await;
             let _now = time::Instant::now();
-            _customer_sender_map.write().await.retain(|_, (_, t, _) | _now.duration_since(*t).as_secs() < 600);
+            let mut _m = _iptables.write().await;
+            _customer_sender_map.write().await.retain(|_, (_, t, _, _meta_info) | {
+                let res = _now.duration_since(*t).as_secs() < 600;
+                if !res {
+                    // 移除客户端，同时移除iptables
+                    for (ip, prefix) in &_meta_info.in_routes4 {
+                        if let Some(addr) = _m.remove(*ip, *prefix as u32) {
+                            log::info!("drop iptables[{}] {}/{}", addr, ip, prefix);
+                        }
+                    }
+                }
+                res
+            });
             log::info!("check retain client {}", _customer_sender_map.read().await.len());
         }
     });
@@ -179,6 +282,7 @@ async fn main() {
     let cfg1 = cfg.clone();
     let _main_sender = main_sender.clone();
     let _customer_sender_map = customer_sender_map.clone();
+    let _iptables = iptables.clone();
     tokio::spawn(async move {
         let mut dly = delay::Delay::new();
         match rcfg {
@@ -194,10 +298,11 @@ async fn main() {
                     let cfgc = cfg1.clone();
                     let __main_sender = _main_sender.clone();
                     let __customer_sender_map = _customer_sender_map.clone();
+                    let __iptables = _iptables.clone();
                     tokio::spawn(async move {
                         match peer_info {
                             Some((_bind, _)) => {
-                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map).await;
+                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __iptables).await;
                             }
                             None => {
                                 log::info!("RELAY DOWN.");
@@ -221,7 +326,8 @@ async fn main() {
                 log::info!("start direct mode.");
                 let _main_sender = main_sender.clone();
                 let _customer_sender_map = customer_sender_map.clone();
-                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map).await;
+                let _iptables = iptables.clone();
+                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, _iptables).await;
             }
             None => {
                 log::info!("no direct config");
