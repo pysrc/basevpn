@@ -174,7 +174,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
 
     let mut in_routes = Vec::new();
     // 放入本机的cidr
-    in_routes.push((tun_ip, prefix));
+    in_routes.push((tun_ip, 32));
     if let Some(routes) = cfg.in_routes {
         for mut route in routes {
             route = route_with_mask(route);
