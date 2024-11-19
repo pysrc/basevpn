@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr}, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}
+    net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}
 };
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
@@ -150,7 +150,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(routes) = cfg.routes {
+        if let Some(routes) = cfg.out_routes {
             for mut route in routes {
                 route = route_with_mask(route);
                 let set_route = format!("ip route add {} dev {}", route, &cfg.tun.name);
@@ -189,11 +189,12 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     cipher.encrypt_in_place(nonce, b"", &mut hart_buf).unwrap();
     cipher.encrypt_in_place(nonce, b"", &mut meta_hart).unwrap();
     let mut _cipher = cipher.clone();
+    let _meta_hart = meta_hart.clone();
     let _ = tokio::spawn(async move {
-        _soc.send(&meta_hart).await.unwrap();
+        _soc.send(&_meta_hart).await.unwrap();
         // 上次心跳时间
         let mut last_hart = Instant::now();
-        let mut buf = Vec::with_capacity(10240);
+        let mut buf = Vec::with_capacity(4096);
         while RUNNING.load(Ordering::Relaxed) {
             let _now = Instant::now();
             if _now.duration_since(last_hart).as_secs() > 60 {
@@ -207,21 +208,22 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
             match timeout(tokio::time::Duration::from_secs(1), rdev.read_buf(&mut buf)).await {
                 Ok(_readr) => {
-                    _readr.unwrap();
-                    match ip::version(&buf) {
-                        ip::Version::V4(_, dst) => {
-                            // 拒绝组播、多播udp，仅支持单播
-                            if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
-                            {
+                    if let Ok(_) = _readr {
+                        match ip::version(&buf) {
+                            ip::Version::V4(_, dst) => {
+                                // 拒绝组播、多播udp，仅支持单播
+                                if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
+                                {
+                                    continue;
+                                }
+                            }
+                            _ => {
                                 continue;
                             }
+                        };
+                        if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
+                            _soc.send(&buf).await.unwrap();
                         }
-                        _ => {
-                            continue;
-                        }
-                    };
-                    if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
-                        _soc.send(&buf).await.unwrap();
                     }
                 }
                 Err(_) => {
@@ -229,15 +231,52 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             }
         }
     });
+
+    let _soc = soc.clone();
+    let _meta_hart = meta_hart.clone();
     let _ = tokio::spawn(async move {
         let mut buf = Vec::with_capacity(4096);
+        let mut last_hart = Instant::now();
         while RUNNING.load(Ordering::Relaxed) {
+            let _now = Instant::now();
+            if _now.duration_since(last_hart).as_secs() > 120 {
+                // 超过2分钟未收到回包 发送meta包重新注册
+                log::info!("2 min no back.");
+                _soc.send(&_meta_hart).await.unwrap();
+            }
             unsafe {
                 buf.set_len(0);
             }
-            soc.recv_buf(&mut buf).await.unwrap();
-            if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
-                wdev.write_all(&buf).await.unwrap();
+            match timeout(tokio::time::Duration::from_secs(1), soc.recv_buf(&mut buf)).await {
+                Ok(Ok(_)) => {
+                    if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
+                        // 判断是不是心跳回包，如果2分钟内还未收到心跳回包就发送meta包重新注册
+                        let (_, dst) = match ip::version(&buf) {
+                            ip::Version::V4(src, dst) => {
+                                (IpAddr::V4(src), IpAddr::V4(dst))
+                            }
+                            _ => {
+                                continue;
+                            }
+                        };
+                        if dst.is_unspecified() {
+                            log::info!("hart back.");
+                            last_hart = Instant::now();
+                            continue;
+                        }
+                        if dst.is_loopback() {
+                            // 重置
+                            log::info!("reset.");
+                            _soc.send(&_meta_hart).await.unwrap();
+                        }
+                        wdev.write_all(&buf).await.unwrap();
+                    }
+                }
+                Ok(Err(e)) => {
+                    log::info!("{} recv error {}", line!(), e);
+                }
+                Err(_) => {
+                }
             }
         }
         _ = wdev.shutdown().await;

@@ -5,6 +5,7 @@ use clap::Parser;
 use config::MetaInfo;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, RwLock}, time};
 use treebitmap::IpLookupTable;
+#[cfg(target_os = "windows")]
 use tun::AbstractDevice;
 
 mod config;
@@ -142,11 +143,13 @@ async fn main() {
     // 放入本机cidr
     iptables.write().await.insert(tun_ip, prefix as u32, tun_ip);
     // 放入本机允许cidr
+    let mut in_routes4 = Vec::<(Ipv4Addr, u8)>::new();
     if let Some(routes) = cfg.in_routes.clone() {
         for mut route in routes {
             route = route_with_mask(route);
             let (ip, pfx) = split_addr(&route);
             iptables.write().await.insert(ip, pfx as u32, tun_ip);
+            in_routes4.push((ip, pfx));
         }
     }
 
@@ -172,7 +175,7 @@ async fn main() {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(routes) = cfg.routes.clone() {
+        if let Some(routes) = cfg.out_routes.clone() {
             for mut route in routes {
                 route = route_with_mask(route);
                 let set_route = format!("ip route add {} dev {}", route, &cfg.tun.name);
@@ -192,6 +195,8 @@ async fn main() {
     let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
     let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>, MetaInfo)>::new()));
+    // 放入本机信息
+    customer_sender_map.write().await.insert(IpAddr::V4(tun_ip), (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), time::Instant::now(), main_sender, MetaInfo{in_routes4}));
 
     let _customer_sender_map = customer_sender_map.clone();
     tokio::task::spawn(async move {
@@ -199,7 +204,7 @@ async fn main() {
         loop {
             let mut buf = BytesMut::with_capacity(10240);
             rdev.read_buf(&mut buf).await.unwrap();
-            let (src, dst) = match ip::version(&buf) {
+            let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
                     if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
@@ -212,7 +217,6 @@ async fn main() {
                     continue;
                 }
             };
-            log::info!("{}->{}", src, dst);
             // 转发到对应的目的地
             let mut m = _customer_sender_map.write().await;
             if let Some((_, _, s, _)) = m.get_mut(&dst) {
@@ -239,51 +243,8 @@ async fn main() {
         // 虚拟网卡写
         loop {
             let buf = main_receiver.recv().await.unwrap();
-            // 目的地是否其他客户端
-            let dst = match ip::version(&buf) {
-                ip::Version::V4(_, dst) => {
-                    match _iptables.try_read() {
-                        Ok(_iptables) => {
-                            match _iptables.longest_match(dst) {
-                                Some((_, _, toaddr)) => {
-                                    // log::info!("route {} to {} by {}", src, dst, toaddr);
-                                    IpAddr::V4(*toaddr)
-                                }
-                                None => {
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            continue;
-                        }
-                    }
-                }
-                _ => {
-                    continue;
-                }
-            };
-
-            let m = _customer_sender_map.read().await;
-            if let Some((_, _, s, _)) = m.get(&dst) {
-                // 转发给其他客户端
-                match s.try_send(buf) {
-                    Ok(()) => {}
-                    Err(TrySendError::Closed(_)) => {
-                        // 通道关闭
-                        log::info!("{} channel closed.", line!());
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        // 队列满了，直接丢弃
-                        log::info!("{} channel full.", line!());
-                    }
-                }
-            } else {
-                wdev.write_all(&buf).await.unwrap();
-                wdev.flush().await.unwrap();
-            }
-
-
+            wdev.write_all(&buf).await.unwrap();
+            wdev.flush().await.unwrap();
         }
     });
 
@@ -295,19 +256,23 @@ async fn main() {
             time::sleep(time::Duration::from_secs(60 * 10)).await;
             let _now = time::Instant::now();
             let mut _m = _iptables.write().await;
-            _customer_sender_map.write().await.retain(|_, (_, t, _, _meta_info) | {
-                let res = _now.duration_since(*t).as_secs() < 600;
-                if !res {
-                    // 移除客户端，同时移除iptables
-                    for (ip, prefix) in &_meta_info.in_routes4 {
-                        if let Some(addr) = _m.remove(*ip, *prefix as u32) {
-                            log::info!("drop iptables[{}] {}/{}", addr, ip, prefix);
+            _customer_sender_map.write().await.retain(|ip, (_, t, _, _meta_info) | {
+                if ip == &tun_ip {
+                    true
+                } else {
+                    let res = _now.duration_since(*t).as_secs() < 600;
+                    if !res {
+                        // 移除客户端，同时移除iptables
+                        for (ip, prefix) in &_meta_info.in_routes4 {
+                            if let Some(addr) = _m.remove(*ip, *prefix as u32) {
+                                log::info!("drop iptables[{}] {}/{}", addr, ip, prefix);
+                            }
                         }
                     }
+                    res
                 }
-                res
             });
-            log::info!("check retain client {}", _customer_sender_map.read().await.len());
+            log::info!("sender map retain {}", _customer_sender_map.read().await.len());
         }
     });
 
@@ -315,7 +280,6 @@ async fn main() {
     // 中继模式
     let rcfg = cfg.relay_config.clone();
     let cfg1 = cfg.clone();
-    let _main_sender = main_sender.clone();
     let _customer_sender_map = customer_sender_map.clone();
     let _iptables = iptables.clone();
     tokio::spawn(async move {
@@ -331,13 +295,12 @@ async fn main() {
                         continue;
                     }
                     let cfgc = cfg1.clone();
-                    let __main_sender = _main_sender.clone();
                     let __customer_sender_map = _customer_sender_map.clone();
                     let __iptables = _iptables.clone();
                     tokio::spawn(async move {
                         match peer_info {
                             Some((_bind, _)) => {
-                                forward::forever(_bind, cfgc, true, __main_sender, __customer_sender_map, __iptables).await;
+                                forward::forever(_bind, cfgc, true, __customer_sender_map, __iptables).await;
                             }
                             None => {
                                 log::info!("RELAY DOWN.");
@@ -359,10 +322,9 @@ async fn main() {
             Some(dcfg) => {
                 let bind = SocketAddr::from_str(&dcfg.bind).unwrap();
                 log::info!("start direct mode.");
-                let _main_sender = main_sender.clone();
                 let _customer_sender_map = customer_sender_map.clone();
                 let _iptables = iptables.clone();
-                forward::forever(bind, cfg, false, _main_sender, _customer_sender_map, _iptables).await;
+                forward::forever(bind, cfg, false, _customer_sender_map, _iptables).await;
             }
             None => {
                 log::info!("no direct config");
