@@ -276,6 +276,8 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
                                 continue;
                             }
                             let plen = u16::from_be_bytes([buf[alen - 3], buf[alen - 2]]);
+                            // let dst = Ipv4Addr::new(buf[alen - 7], buf[alen - 6], buf[alen - 5], buf[alen - 4]);
+                            // log::info!("send to {}", dst);
                             unsafe {
                                 buf.set_len(plen as usize);
                             }
