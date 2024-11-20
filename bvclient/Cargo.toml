@@ -16,6 +16,8 @@ clap = { workspace = true }
 tun = { workspace = true }
 chacha20poly1305 = { workspace = true }
 
+bvcommon = { path = "../bvcommon" }
+
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

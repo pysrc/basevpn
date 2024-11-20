@@ -1,6 +1,9 @@
 use std::{collections::HashMap, fs::File, io::Write, net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use buffer::PBuffer;
+use bytes::{BufMut, Bytes, BytesMut};
+use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::Parser;
 use config::MetaInfo;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, RwLock}, time};
@@ -191,6 +194,15 @@ async fn main() {
     
     let (mut rdev, mut wdev) = tokio::io::split(dev);
 
+    // 1. 初始化密钥和 nonce（随机数）
+    let _k = cfg.cipher_config.key.clone();
+
+    let key = Key::from_slice(_k.as_bytes()); // 密钥长度必须是 32 字节
+    let nonce = unsafe { Nonce::from_slice(NONCE.as_bytes()) }; // 12 字节的 nonce
+
+    // 2. 创建加密器实例
+    let cipher = ChaCha20Poly1305::new(key);
+
     // 主通道
     let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
@@ -199,6 +211,7 @@ async fn main() {
     customer_sender_map.write().await.insert(IpAddr::V4(tun_ip), (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), time::Instant::now(), main_sender, MetaInfo{in_routes4}));
 
     let _customer_sender_map = customer_sender_map.clone();
+    let mut _cipher = cipher.clone();
     tokio::task::spawn(async move {
         // 虚拟网卡读
         loop {
@@ -220,6 +233,21 @@ async fn main() {
             // 转发到对应的目的地
             let mut m = _customer_sender_map.write().await;
             if let Some((_, _, s, _)) = m.get_mut(&dst) {
+                let mut pb = PBuffer::new(buf);
+                _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
+                let mut buf = pb.into_buffer();
+                let alen = buf.len();
+                match dst {
+                    IpAddr::V4(dst) => {
+                        buf.extend_from_slice(&dst.octets());
+                    }
+                    _ => {
+
+                    }
+                }
+                buf.extend_from_slice(&u16::to_be_bytes(alen as u16));
+                buf.put_u8(bvcommon::TYPE_IPV4);
+
                 match s.try_send(buf.freeze()) {
                     Ok(()) => {
 
@@ -239,10 +267,25 @@ async fn main() {
     });
     let _customer_sender_map = customer_sender_map.clone();
     let _iptables = iptables.clone();
+    let mut _cipher = cipher.clone();
     tokio::spawn(async move {
         // 虚拟网卡写
         loop {
             let buf = main_receiver.recv().await.unwrap();
+            // 解码数据
+            let alen = buf.len();
+            if alen < 7 {
+                continue;
+            }
+            let length = u16::from_be_bytes([buf[alen - 3], buf[alen - 2]]) as usize;
+            let mut buf = buf.try_into_mut().unwrap();
+            unsafe {
+                buf.set_len(length);
+            }
+            let mut pb = PBuffer::new(buf);
+            _cipher.decrypt_in_place(nonce, b"", &mut pb).unwrap();
+            let buf = pb.into_buffer();
+            
             wdev.write_all(&buf).await.unwrap();
             wdev.flush().await.unwrap();
         }

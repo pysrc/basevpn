@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr}, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}
+    net::{Ipv4Addr, SocketAddr}, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}
 };
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
@@ -92,9 +92,7 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static mut NONCE: String = String::new();
 
 pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
-
-    let mut hart_buf = vec![64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
+    
     // 1. 初始化密钥和 nonce（随机数）
     let _k = cfg.cipher_config.key.clone();
     unsafe {
@@ -113,8 +111,11 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     // 处理tun设备
     log::info!("ip address is {}", cfg.tun.ip);
     let (tun_ip, prefix) = split_addr(&cfg.tun.ip);
-    hart_buf[12..16].copy_from_slice(&tun_ip.octets());
-    log::info!("hart buf: {:?}", hart_buf);
+    // 心跳包
+    let mut hart_buf = vec![0u8;5];
+    hart_buf[4] = bvcommon::TYPE_HART;
+    hart_buf[0..4].copy_from_slice(&tun_ip.octets());
+
     let mut config = tun::Configuration::default();
     config
         .tun_name(&cfg.tun.name)
@@ -168,9 +169,8 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let soc = Arc::new(soc);
 
     let _soc = soc.clone();
-    // 第一次心跳包，带上本机的一些信息
-    let mut meta_hart = Vec::<u8>::new();
-    meta_hart.extend_from_slice(&hart_buf);
+    // 信息包
+    let mut info = Vec::<u8>::new();
 
     let mut in_routes = Vec::new();
     // 放入本机的cidr
@@ -184,14 +184,19 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let mi: MetaInfo = MetaInfo{
         in_routes4: in_routes,
     };
-    serde_yaml::to_writer(&mut meta_hart, &mi).unwrap();
+    serde_yaml::to_writer(&mut info, &mi).unwrap();
+    cipher.encrypt_in_place(nonce, b"", &mut info).unwrap();
 
-    cipher.encrypt_in_place(nonce, b"", &mut hart_buf).unwrap();
-    cipher.encrypt_in_place(nonce, b"", &mut meta_hart).unwrap();
+    let info_len = info.len();
+    info.extend_from_slice(&tun_ip.octets());
+    info.extend_from_slice(&u16::to_be_bytes(info_len as u16));
+    info.push(bvcommon::TYPE_INFO);
+
+
     let mut _cipher = cipher.clone();
-    let _meta_hart = meta_hart.clone();
+    let _info = info.clone();
     let _ = tokio::spawn(async move {
-        _soc.send(&_meta_hart).await.unwrap();
+        _soc.send(&_info).await.unwrap();
         // 上次心跳时间
         let mut last_hart = Instant::now();
         let mut buf = Vec::with_capacity(4096);
@@ -200,7 +205,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             if _now.duration_since(last_hart).as_secs() > 60 {
                 // 发送心跳
                 last_hart = _now;
-                _soc.send(&hart_buf).await.unwrap();
+                _ = _soc.send(&hart_buf).await;
                 log::info!("hart to server.");
             }
             unsafe {
@@ -209,20 +214,25 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
             match timeout(tokio::time::Duration::from_secs(1), rdev.read_buf(&mut buf)).await {
                 Ok(_readr) => {
                     if let Ok(_) = _readr {
-                        match ip::version(&buf) {
+                        let dst = match ip::version(&buf) {
                             ip::Version::V4(_, dst) => {
                                 // 拒绝组播、多播udp，仅支持单播
                                 if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
                                 {
                                     continue;
                                 }
+                                dst
                             }
                             _ => {
                                 continue;
                             }
                         };
                         if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
-                            _soc.send(&buf).await.unwrap();
+                            let alen = buf.len();
+                            buf.extend_from_slice(&dst.octets());
+                            buf.extend_from_slice(&u16::to_be_bytes(alen as u16));
+                            buf.push(bvcommon::TYPE_IPV4);
+                            _ = _soc.send(&buf).await;
                         }
                     }
                 }
@@ -233,43 +243,47 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     });
 
     let _soc = soc.clone();
-    let _meta_hart = meta_hart.clone();
+    let _info = info.clone();
     let _ = tokio::spawn(async move {
         let mut buf = Vec::with_capacity(4096);
         let mut last_hart = Instant::now();
         while RUNNING.load(Ordering::Relaxed) {
             let _now = Instant::now();
             if _now.duration_since(last_hart).as_secs() > 120 {
-                // 超过2分钟未收到回包 发送meta包重新注册
+                // 超过2分钟未收到回包 发送info包重新注册
                 log::info!("2 min no back.");
-                _soc.send(&_meta_hart).await.unwrap();
+                _ = _soc.send(&_info).await;
             }
             unsafe {
                 buf.set_len(0);
             }
             match timeout(tokio::time::Duration::from_secs(1), soc.recv_buf(&mut buf)).await {
                 Ok(Ok(_)) => {
-                    if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
-                        // 判断是不是心跳回包，如果2分钟内还未收到心跳回包就发送meta包重新注册
-                        let (_, dst) = match ip::version(&buf) {
-                            ip::Version::V4(src, dst) => {
-                                (IpAddr::V4(src), IpAddr::V4(dst))
-                            }
-                            _ => {
-                                continue;
-                            }
-                        };
-                        if dst.is_unspecified() {
+                    let alen: usize = buf.len();
+                    match buf[alen - 1] {
+                        bvcommon::TYPE_HARTB => {
+                            // 心跳响应包
                             log::info!("hart back.");
                             last_hart = Instant::now();
-                            continue;
                         }
-                        if dst.is_loopback() {
-                            // 重置
-                            log::info!("reset.");
-                            _soc.send(&_meta_hart).await.unwrap();
+                        bvcommon::TYPE_RST => {
+                            // reset包
+                            let _ = _soc.send(&_info).await;
                         }
-                        wdev.write_all(&buf).await.unwrap();
+                        bvcommon::TYPE_IPV4 => {
+                            // ipv4包
+                            if alen < 7 {
+                                continue;
+                            }
+                            let plen = u16::from_be_bytes([buf[alen - 3], buf[alen - 2]]);
+                            unsafe {
+                                buf.set_len(plen as usize);
+                            }
+                            if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
+                                wdev.write_all(&buf).await.unwrap();
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Err(e)) => {

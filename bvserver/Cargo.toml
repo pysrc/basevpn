@@ -22,5 +22,7 @@ bytes = { workspace = true }
 
 treebitmap = { workspace = true }
 
+bvcommon = { path = "../bvcommon" }
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

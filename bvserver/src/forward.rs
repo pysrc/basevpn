@@ -7,7 +7,7 @@ use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use treebitmap::IpLookupTable; // 使用 ChaCha20-Poly1305 实现
 
-use crate::{buffer::PBuffer, config::{Config, MetaInfo}, ip, NONCE};
+use crate::{buffer::PBuffer, config::{Config, MetaInfo}, NONCE};
 
 /**
  * bind: 绑定地址
@@ -46,65 +46,65 @@ pub async fn forever(
                 continue;
             }
         };
-        let mut pb = PBuffer::new(buf);
-        if let Err(_) = cipher.decrypt_in_place(nonce, b"", &mut pb) {
+        if buf.len() == 0 {
             continue;
         }
-        buf = pb.into_buffer();
-        // 接收客户端数据包
-        // 检查源地址是否存
-        let (src, dst) = match ip::version(&buf) {
-            ip::Version::V4(src, dst) => {
-                (IpAddr::V4(src), IpAddr::V4(dst))
-            }
-            _ => {
-                continue;
-            }
-        };
-
-        if dst.is_unspecified() {
-            if buf.len() <= 20 {
+        let alen = buf.len();
+        match buf[alen - 1] {
+            bvcommon::TYPE_HART => {
                 // 心跳包
+                if alen != 5 {
+                    continue;
+                }
+                let src = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
                 // 更新心跳时间
                 log::info!("hart [{}].", src);
-                match customer_sender_map.write().await.get_mut(&src) {
+                match customer_sender_map.write().await.get_mut(&IpAddr::V4(src)) {
                     Some((_org_addr, _t, _, _)) => {
                         if _org_addr != &addr {
                             // 地址发生变化
                             log::info!("{} socket address change {} -> {}", line!(), _org_addr, addr);
                             *_org_addr = addr;
                         }
-                        *_t = Instant::now();
-                        let mut pb = PBuffer::new(buf);
-                        cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
-                        let buf = pb.into_buffer();
+                        // 响应
+                        buf[4] = bvcommon::TYPE_HARTB;
                         let _ = soc.try_send_to(&buf, addr);
                     }
                     None => {
                         log::info!("send reset[{}].", src);
                         // 立即重置
-                        buf[16] = 127;
-                        let mut pb = PBuffer::new(buf);
-                        cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
-                        let buf = pb.into_buffer();
-                        let _ = soc.try_send_to(&buf, addr);
+                        let _ = soc.try_send_to(&[bvcommon::TYPE_RST], addr);
                     }
                 }
-                continue;
-            } else {
-                // reset包
+            }
+            bvcommon::TYPE_INFO => {
+                // 环境信息包
+                if alen < 7 {
+                    continue;
+                }
+                let length = u16::from_be_bytes([buf[alen - 3], buf[alen - 2]]) as usize;
+                let src = Ipv4Addr::new(buf[alen - 7], buf[alen - 6], buf[alen - 5], buf[alen - 4]);
+                unsafe {
+                    buf.set_len(length);
+                }
+                // 解密数据包
+                let mut pb = PBuffer::new(buf);
+                if let Err(_) = cipher.decrypt_in_place(nonce, b"", &mut pb) {
+                    continue;
+                }
+                buf = pb.into_buffer();
+                
+                // 重置客户端
                 let (sender, mut receiver) = mpsc::channel::<Bytes>(100);
-                if let Ok(meta_info) = serde_yaml::from_slice::<MetaInfo>(&buf[20..]) {
+                if let Ok(meta_info) = serde_yaml::from_slice::<MetaInfo>(&buf) {
                     log::info!("client meta info: {:?}", meta_info);
                     {
                         let mut m = iptables.write().await;
                         for (ip, masklen) in &meta_info.in_routes4 {
-                            if let IpAddr::V4(addr) = src {
-                                m.insert(*ip, *masklen as u32, addr);
-                            }
+                            m.insert(*ip, *masklen as u32, src);
                         }
                     }
-                    let old = customer_sender_map.write().await.insert(src, (addr, Instant::now(), sender, meta_info));
+                    let old = customer_sender_map.write().await.insert(IpAddr::V4(src), (addr, Instant::now(), sender, meta_info));
                     if let Some(_) = old {
                         log::info!("{} break old client {}", line!(), src);
                     }
@@ -116,7 +116,7 @@ pub async fn forever(
                 let mut _running = running.clone();
                 let _customer_sender_map = customer_sender_map.clone();
                 tokio::spawn(async move {
-                    // 接收tun设备的数据包
+                    // 接收数据包
                     loop {
                         let buf = match receiver.recv().await {
                             Some(_buf) => _buf,
@@ -128,13 +128,9 @@ pub async fn forever(
                                 return;
                             }
                         };
-                        let mbuf = buf.try_into_mut().unwrap();
-                        let mut pb = PBuffer::new(mbuf);
-                        _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
-                        let buf = pb.into_buffer();
                         // 拿最新地址
                         if let Ok(x) = _customer_sender_map.try_read() {
-                            match x.get(&src) {
+                            match x.get(&IpAddr::V4(src)) {
                                 Some((_addr, _, _, _)) => {
                                     match _soc.try_send_to(&buf, *_addr) {
                                         Ok(_) => {}
@@ -164,49 +160,49 @@ pub async fn forever(
                     }
                 });
             }
-        } else {
-            // 正常数据包
-            // 判断目标地址
-            match dst {
-                IpAddr::V4(dst4) => {
-                    match iptables.try_read() {
-                        Ok(_iptables) => {
-                            match _iptables.longest_match(dst4) {
-                                Some((_, _, toaddr)) => {
-                                    let to = IpAddr::V4(*toaddr);
-                                    // log::info!("{} send to {} -> {} by {}", line!(), src, dst, to);
-                                    match customer_sender_map.read().await.get(&to) {
-                                        Some((_, _, c, _)) => {
-                                            match c.try_send(buf.freeze()) {
-                                                Ok(()) => {}
-                                                Err(TrySendError::Closed(_)) => {
-                                                    // 通道关闭
-                                                    log::info!("{} channel closed.", line!());
-                                                }
-                                                Err(TrySendError::Full(_)) => {
-                                                    // 队列满了，直接丢弃
-                                                    log::info!("{} channel full.", line!());
-                                                }
+            bvcommon::TYPE_IPV4 => {
+                // ipv4信息包
+                if alen < 7 {
+                    continue;
+                }
+                let dst = Ipv4Addr::new(buf[alen - 7], buf[alen - 6], buf[alen - 5], buf[alen - 4]);
+                match iptables.try_read() {
+                    Ok(_iptables) => {
+                        match _iptables.longest_match(dst) {
+                            Some((_, _, toaddr)) => {
+                                let to = IpAddr::V4(*toaddr);
+                                // log::info!("{} send to {} by {}", line!(), dst, to);
+                                match customer_sender_map.read().await.get(&to) {
+                                    Some((_, _, c, _)) => {
+                                        match c.try_send(buf.freeze()) {
+                                            Ok(()) => {}
+                                            Err(TrySendError::Closed(_)) => {
+                                                // 通道关闭
+                                                log::info!("{} channel closed.", line!());
+                                            }
+                                            Err(TrySendError::Full(_)) => {
+                                                // 队列满了，直接丢弃
+                                                log::info!("{} channel full.", line!());
                                             }
                                         }
-                                        None => {
-                                            log::info!("unclear {} -> {}", src, dst);
-                                        }
+                                    }
+                                    None => {
+                                        log::info!("unclear {}", dst);
                                     }
                                 }
-                                None => {
-                                    continue;
-                                }
+                            }
+                            None => {
+                                continue;
                             }
                         }
-                        Err(_) => {
-                            continue;
-                        }
-                    }       
+                    }
+                    Err(_) => {
+                        continue;
+                    }
                 }
-                _ => {
-                    log::info!("ipv6 todo");
-                }
+            }
+            _ => {
+
             }
         }
     }

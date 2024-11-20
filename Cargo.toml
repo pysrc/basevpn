@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bvclient", "bvrelay", "bvserver"]
+members = ["bvclient", "bvcommon", "bvrelay", "bvserver"]
 
 [workspace.dependencies]
 log = "0.4"
