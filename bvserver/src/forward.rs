@@ -61,6 +61,7 @@ pub async fn forever(
                 log::info!("hart [{}].", src);
                 match customer_sender_map.write().await.get_mut(&IpAddr::V4(src)) {
                     Some((_org_addr, _t, _, _)) => {
+                        *_t = Instant::now();
                         if _org_addr != &addr {
                             // 地址发生变化
                             log::info!("{} socket address change {} -> {}", line!(), _org_addr, addr);
