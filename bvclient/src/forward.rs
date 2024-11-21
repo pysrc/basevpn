@@ -18,7 +18,9 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
     // 1. 初始化密钥和 nonce（随机数）
     let _k = cfg.cipher_config.key.clone();
     unsafe {
-        NONCE.push_str(&cfg.cipher_config.nonce);
+        if NONCE.is_empty() {
+            NONCE.push_str(&cfg.cipher_config.nonce);
+        }
     }
     
     let key = Key::from_slice(_k.as_bytes()); // 密钥长度必须是 32 字节
