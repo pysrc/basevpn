@@ -1,98 +1,20 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr}, str::FromStr, sync::{atomic::{AtomicBool, Ordering}, Arc}
+    net::{Ipv4Addr, SocketAddr}, sync::{atomic::{AtomicBool, Ordering}, Arc}
 };
 
+use bytes::{BufMut, Bytes, BytesMut};
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce}; // 使用 ChaCha20-Poly1305 实现
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UdpSocket, time::{timeout, Instant}};
+use tokio::{net::UdpSocket, sync::mpsc, time::{timeout, Instant}};
 
-#[cfg(target_os = "windows")]
-use tun::AbstractDevice;
-
-use crate::{ config::{self, MetaInfo}, ip, MTU};
-
-fn prefix2mask(prefix: u8) -> Ipv4Addr {
-    // 确保 prefix 在 0 到 32 的范围内
-    assert!(prefix <= 32);
-
-    // 计算掩码，将高位的 prefix 位设置为 1，其余位设置为 0
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-
-    // 将 mask 转换为 IPv4 地址
-    Ipv4Addr::from(mask)
-}
-
-fn binmatch(n: u8) -> Option<u8> {
-    match n {
-        0b0000_0000 => Some(0),
-        0b1000_0000 => Some(1),
-        0b1100_0000 => Some(2),
-        0b1110_0000 => Some(3),
-        0b1111_0000 => Some(4),
-        0b1111_1000 => Some(5),
-        0b1111_1100 => Some(6),
-        0b1111_1110 => Some(7),
-        0b1111_1111 => Some(8),
-        _ => None,
-    }
-}
-
-// 255.255.252.0 -> 22
-fn mask2prefix(mask: &str) -> u8 {
-    let sp: Vec<&str> = mask.split(".").collect();
-    let a: u8 = sp[0].parse().unwrap();
-    let b: u8 = sp[1].parse().unwrap();
-    let c: u8 = sp[2].parse().unwrap();
-    let d: u8 = sp[3].parse().unwrap();
-    let mut res = 0;
-    if let Some(k) = binmatch(a) {
-        res += k;
-    }
-    if let Some(k) = binmatch(b) {
-        res += k;
-    }
-    if let Some(k) = binmatch(c) {
-        res += k;
-    }
-    if let Some(k) = binmatch(d) {
-        res += k;
-    }
-    res
-}
-
-fn route_with_mask(route: String) -> String {
-    let mut route = route;
-    if !route.contains("/") {
-        route = route + "/32";
-    }
-    let rm: Vec<&str> = route.split("/").collect();
-    let mask = rm[1];
-    if mask.contains(".") {
-        // eg. 255.255.0.0
-        let prefix = mask2prefix(mask);
-        route = format!("{}/{}", rm[0], prefix);
-    }
-    return route;
-}
-
-
-fn split_addr(cidr: &str) -> (Ipv4Addr, u8) {
-    let ipp: Vec<&str> =  cidr.split('/').collect();
-    let prefix = u8::from_str(ipp.get(1).unwrap()).unwrap();
-    let ip: Ipv4Addr = Ipv4Addr::from_str(ipp.get(0).unwrap()).expect("error tun ip");
-    (ip, prefix)
-}
-
-static RUNNING: AtomicBool = AtomicBool::new(true);
+use crate::{ buffer::PBuffer, config::{Config, MetaInfo}, ip, route_with_mask, split_addr};
 
 static mut NONCE: String = String::new();
 
-pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
+pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: Config, dev_sender: mpsc::Sender<Bytes>, mut soc_receiver: mpsc::Receiver<Bytes>) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
     
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+
     // 1. 初始化密钥和 nonce（随机数）
     let _k = cfg.cipher_config.key.clone();
     unsafe {
@@ -108,63 +30,12 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
     let soc = UdpSocket::bind(bind).await.unwrap();
     soc.connect(peer).await.unwrap();
     log::info!("local and remote: {} -> {}", soc.local_addr().unwrap(), peer);
-    // 处理tun设备
-    log::info!("ip address is {}", cfg.tun.ip);
-    let (tun_ip, prefix) = split_addr(&cfg.tun.ip);
+
+
     // 心跳包
     let mut hart_buf = vec![0u8;5];
     hart_buf[4] = bvcommon::TYPE_HART;
     hart_buf[0..4].copy_from_slice(&tun_ip.octets());
-
-    let mut config = tun::Configuration::default();
-    config
-        .tun_name(&cfg.tun.name)
-        .address(tun_ip)
-        .netmask(prefix2mask(prefix))
-        .mtu(MTU as u16)
-        .up();
-
-    #[cfg(target_os = "linux")]
-    config.platform_config(|config| {
-        config.ensure_root_privileges(true);
-    });
-
-    let dev = tun::create_as_async(&config).unwrap();
-
-    // 设置路由
-    #[cfg(target_os = "windows")]
-    {
-        let index = dev.tun_index().unwrap();
-        log::info!("tun index is {}", index);
-        if let Some(routes) = cfg.out_routes {
-            for mut route in routes {
-                route = route_with_mask(route);
-                let set_route = format!("netsh interface ip add route {} {}", route, index);
-                log::info!("{}", set_route);
-                std::process::Command::new("cmd")
-                    .arg("/C")
-                    .arg(set_route)
-                    .output()
-                    .unwrap();
-            }
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(routes) = cfg.out_routes {
-            for mut route in routes {
-                route = route_with_mask(route);
-                let set_route = format!("ip route add {} dev {}", route, &cfg.tun.name);
-                log::info!("{}", set_route);
-                std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(set_route)
-                    .output()
-                    .unwrap();
-            }
-        }
-    }
-    let (mut rdev, mut wdev) = tokio::io::split(dev);
 
     let soc = Arc::new(soc);
 
@@ -195,11 +66,10 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
 
     let mut _cipher = cipher.clone();
     let _info = info.clone();
-    let _ = tokio::spawn(async move {
+    let th1 = tokio::spawn(async move {
         _soc.send(&_info).await.unwrap();
         // 上次心跳时间
         let mut last_hart = Instant::now();
-        let mut buf = Vec::with_capacity(4096);
         while RUNNING.load(Ordering::Relaxed) {
             let _now = Instant::now();
             if _now.duration_since(last_hart).as_secs() > 60 {
@@ -208,12 +78,9 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
                 _ = _soc.send(&hart_buf).await;
                 log::info!("hart to server.");
             }
-            unsafe {
-                buf.set_len(0);
-            }
-            match timeout(tokio::time::Duration::from_secs(1), rdev.read_buf(&mut buf)).await {
+            match timeout(tokio::time::Duration::from_secs(1), soc_receiver.recv()).await {
                 Ok(_readr) => {
-                    if let Ok(_) = _readr {
+                    if let Some(buf) = _readr {
                         let dst = match ip::version(&buf) {
                             ip::Version::V4(_, dst) => {
                                 // 拒绝组播、多播udp，仅支持单播
@@ -227,12 +94,20 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
                                 continue;
                             }
                         };
-                        if let Ok(()) = _cipher.encrypt_in_place(nonce, b"", &mut buf) {
-                            let alen = buf.len();
-                            buf.extend_from_slice(&dst.octets());
-                            buf.extend_from_slice(&u16::to_be_bytes(alen as u16));
-                            buf.push(bvcommon::TYPE_IPV4);
-                            _ = _soc.send(&buf).await;
+
+                        let buf = BytesMut::from(buf);
+                        let mut pb = PBuffer::new(buf);
+                        _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
+                        let mut buf = pb.into_buffer();
+                        let alen = buf.len();
+                        buf.extend_from_slice(&dst.octets());
+                        buf.extend_from_slice(&u16::to_be_bytes(alen as u16));
+                        buf.put_u8(bvcommon::TYPE_IPV4);
+                        if let Err(e) = _soc.send(&buf).await {
+                            log::info!("{} -> {}", line!(), e);
+                            // soc异常
+                            RUNNING.store(false, Ordering::Relaxed);
+                            return soc_receiver;
                         }
                     }
                 }
@@ -240,19 +115,25 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
                 }
             }
         }
+        return soc_receiver;
     });
 
     let _soc = soc.clone();
     let _info = info.clone();
-    let _ = tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(4096);
+    let mut _cipher = cipher.clone();
+    let th2 = tokio::spawn(async move {
         let mut last_hart = Instant::now();
         while RUNNING.load(Ordering::Relaxed) {
+            let mut buf = BytesMut::with_capacity(4096);
             let _now = Instant::now();
             if _now.duration_since(last_hart).as_secs() > 120 {
                 // 超过2分钟未收到回包 发送info包重新注册
                 log::info!("2 min no back.");
-                _ = _soc.send(&_info).await;
+                if let Err(e) = _soc.send(&_info).await {
+                    log::info!("{} -> {}", line!(), e);
+                    RUNNING.store(false, Ordering::Relaxed);
+                    return dev_sender;
+                }
             }
             unsafe {
                 buf.set_len(0);
@@ -276,13 +157,14 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
                                 continue;
                             }
                             let plen = u16::from_be_bytes([buf[alen - 3], buf[alen - 2]]);
-                            // let dst = Ipv4Addr::new(buf[alen - 7], buf[alen - 6], buf[alen - 5], buf[alen - 4]);
-                            // log::info!("send to {}", dst);
                             unsafe {
                                 buf.set_len(plen as usize);
                             }
-                            if let Ok(()) = cipher.decrypt_in_place(nonce, b"", &mut buf) {
-                                wdev.write_all(&buf).await.unwrap();
+
+                            let mut pb = PBuffer::new(buf);
+                            if let Ok(_) = _cipher.decrypt_in_place(nonce, b"", &mut pb) {
+                                let buf = pb.into_buffer();
+                                let _ = dev_sender.try_send(buf.freeze());
                             }
                         }
                         _ => {}
@@ -295,12 +177,10 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, cfg: config::Config) {
                 }
             }
         }
-        _ = wdev.shutdown().await;
+        return dev_sender;
     });
-    log::info!("ctrl + c to stop.");
-    _ = tokio::signal::ctrl_c().await;
-    // log::info!("stopping.");
-    // RUNNING.store(false, Ordering::Relaxed);
-    // _ = th1.await;
-    // _ = th2.await;
+
+    let soc_receiver = th1.await.unwrap();
+    let dev_sender = th2.await.unwrap();
+    (dev_sender, soc_receiver)
 }

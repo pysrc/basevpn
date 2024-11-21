@@ -11,7 +11,7 @@ serde_yaml = { workspace = true }
 sha1 = { workspace = true }
 
 tokio = { workspace = true }
-
+bytes = { workspace = true }
 clap = { workspace = true }
 tun = { workspace = true }
 chacha20poly1305 = { workspace = true }

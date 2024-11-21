@@ -216,7 +216,9 @@ async fn main() {
         // 虚拟网卡读
         loop {
             let mut buf = BytesMut::with_capacity(10240);
-            rdev.read_buf(&mut buf).await.unwrap();
+            if let Err(_) = rdev.read_buf(&mut buf).await {
+                continue;
+            }
             let (_, dst) = match ip::version(&buf) {
                 ip::Version::V4(src, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
@@ -283,11 +285,11 @@ async fn main() {
                 buf.set_len(length);
             }
             let mut pb = PBuffer::new(buf);
-            _cipher.decrypt_in_place(nonce, b"", &mut pb).unwrap();
-            let buf = pb.into_buffer();
-            
-            wdev.write_all(&buf).await.unwrap();
-            wdev.flush().await.unwrap();
+            if let Ok(_) = _cipher.decrypt_in_place(nonce, b"", &mut pb) {
+                let buf = pb.into_buffer();
+                wdev.write_all(&buf).await.unwrap();
+                wdev.flush().await.unwrap();
+            }
         }
     });
 
