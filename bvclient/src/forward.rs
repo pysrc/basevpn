@@ -130,14 +130,11 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
         while _running.load(Ordering::Relaxed) {
             let mut buf = BytesMut::with_capacity(4096);
             let _now = Instant::now();
-            if _now.duration_since(last_hart).as_secs() > 120 {
+            if _now.duration_since(last_hart).as_secs() > 60 * 3 {
                 // 超过2分钟未收到回包 发送info包重新注册
-                log::info!("2 min no back.");
-                if let Err(e) = _soc.send(&_info).await {
-                    log::info!("{} -> {}", line!(), e);
-                    _running.store(false, Ordering::Relaxed);
-                    return dev_sender;
-                }
+                log::info!("3 min no back.");
+                _running.store(false, Ordering::Relaxed);
+                return dev_sender;
             }
             unsafe {
                 buf.set_len(0);
@@ -183,8 +180,9 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
         }
         return dev_sender;
     });
-
+    log::info!("start.");
     let soc_receiver = th1.await.unwrap();
     let dev_sender = th2.await.unwrap();
+    log::info!("end.");
     (dev_sender, soc_receiver)
 }
