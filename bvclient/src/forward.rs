@@ -13,7 +13,7 @@ static mut NONCE: String = String::new();
 
 pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: Config, dev_sender: mpsc::Sender<Bytes>, mut soc_receiver: mpsc::Receiver<Bytes>) -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
     
-    static RUNNING: AtomicBool = AtomicBool::new(true);
+    let running = Arc::new(AtomicBool::new(true));
 
     // 1. 初始化密钥和 nonce（随机数）
     let _k = cfg.cipher_config.key.clone();
@@ -22,7 +22,6 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
             NONCE.push_str(&cfg.cipher_config.nonce);
         }
     }
-    
     let key = Key::from_slice(_k.as_bytes()); // 密钥长度必须是 32 字节
     let nonce = unsafe { Nonce::from_slice(NONCE.as_bytes()) }; // 12 字节的 nonce
 
@@ -68,11 +67,13 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
 
     let mut _cipher = cipher.clone();
     let _info = info.clone();
+    let _running = running.clone();
     let th1 = tokio::spawn(async move {
+    
         _soc.send(&_info).await.unwrap();
         // 上次心跳时间
         let mut last_hart = Instant::now();
-        while RUNNING.load(Ordering::Relaxed) {
+        while _running.load(Ordering::Relaxed) {
             let _now = Instant::now();
             if _now.duration_since(last_hart).as_secs() > 60 {
                 // 发送心跳
@@ -108,7 +109,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
                         if let Err(e) = _soc.send(&buf).await {
                             log::info!("{} -> {}", line!(), e);
                             // soc异常
-                            RUNNING.store(false, Ordering::Relaxed);
+                            _running.store(false, Ordering::Relaxed);
                             return soc_receiver;
                         }
                     }
@@ -123,9 +124,10 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
     let _soc = soc.clone();
     let _info = info.clone();
     let mut _cipher = cipher.clone();
+    let _running = running.clone();
     let th2 = tokio::spawn(async move {
         let mut last_hart = Instant::now();
-        while RUNNING.load(Ordering::Relaxed) {
+        while _running.load(Ordering::Relaxed) {
             let mut buf = BytesMut::with_capacity(4096);
             let _now = Instant::now();
             if _now.duration_since(last_hart).as_secs() > 120 {
@@ -133,7 +135,7 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
                 log::info!("2 min no back.");
                 if let Err(e) = _soc.send(&_info).await {
                     log::info!("{} -> {}", line!(), e);
-                    RUNNING.store(false, Ordering::Relaxed);
+                    _running.store(false, Ordering::Relaxed);
                     return dev_sender;
                 }
             }
