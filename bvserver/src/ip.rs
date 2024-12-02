@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 
+#[allow(dead_code)]
 pub enum Version {
     V4(Ipv4Addr, Ipv4Addr),
     Others,

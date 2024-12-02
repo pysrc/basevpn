@@ -212,6 +212,7 @@ async fn main() {
 
     let _customer_sender_map = customer_sender_map.clone();
     let mut _cipher = cipher.clone();
+    let _iptables = iptables.clone();
     tokio::task::spawn(async move {
         // 虚拟网卡读
         loop {
@@ -219,56 +220,66 @@ async fn main() {
             if let Err(_) = rdev.read_buf(&mut buf).await {
                 continue;
             }
-            let (_, dst) = match ip::version(&buf) {
-                ip::Version::V4(src, dst) => {
+            let dst = match ip::version(&buf) {
+                ip::Version::V4(_, dst) => {
                     // 拒绝组播、多播udp，仅支持单播
                     if (dst.octets()[0] >= 224 && dst.octets()[0] <= 239) || dst.octets()[3] == 255
                     {
                         continue;
                     }
-                    (IpAddr::V4(src), IpAddr::V4(dst))
+                    dst
                 }
                 _ => {
                     continue;
                 }
             };
-            // 转发到对应的目的地
-            let mut m = _customer_sender_map.write().await;
-            if let Some((_, _, s, _)) = m.get_mut(&dst) {
-                let mut pb = PBuffer::new(buf);
-                _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
-                let mut buf = pb.into_buffer();
-                let alen = buf.len();
-                match dst {
-                    IpAddr::V4(dst) => {
-                        buf.extend_from_slice(&dst.octets());
-                    }
-                    _ => {
+            let mut pb = PBuffer::new(buf);
+            _cipher.encrypt_in_place(nonce, b"", &mut pb).unwrap();
+            let mut buf = pb.into_buffer();
+            let alen = buf.len();
+            buf.extend_from_slice(&dst.octets());
+            buf.extend_from_slice(&u16::to_be_bytes(alen as u16));
+            buf.put_u8(bvcommon::TYPE_IPV4);
 
+            // 转发到对应的目的地
+            match _iptables.try_read() {
+                Ok(_iptables) => {
+                    match _iptables.longest_match(dst) {
+                        Some((_, _, toaddr)) => {
+                            let to = IpAddr::V4(*toaddr);
+                            // log::info!("{} send to {} by {}", line!(), dst, to);
+                            match _customer_sender_map.read().await.get(&to) {
+                                Some((_, _, c, _)) => {
+                                    match c.try_send(buf.freeze()) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Closed(_)) => {
+                                            // 通道关闭
+                                            log::info!("{} channel closed.", line!());
+                                        }
+                                        Err(TrySendError::Full(_)) => {
+                                            // 队列满了，直接丢弃
+                                            log::info!("{} channel full.", line!());
+                                        }
+                                    }
+                                }
+                                None => {
+                                    log::info!("unclear {}", dst);
+                                }
+                            }
+                        }
+                        None => {
+                            continue;
+                        }
                     }
                 }
-                buf.extend_from_slice(&u16::to_be_bytes(alen as u16));
-                buf.put_u8(bvcommon::TYPE_IPV4);
-
-                match s.try_send(buf.freeze()) {
-                    Ok(()) => {
-
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        // 通道关闭
-                        log::info!("{} channel closed.", line!());
-                        _ = m.remove(&dst);
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        // 队列满了，直接丢弃
-                        log::info!("{} channel full.", line!());
-                    }
+                Err(_) => {
+                    continue;
                 }
             }
         }
     });
     let _customer_sender_map = customer_sender_map.clone();
-    let _iptables = iptables.clone();
+    // let _iptables = iptables.clone();
     let mut _cipher = cipher.clone();
     tokio::spawn(async move {
         // 虚拟网卡写
