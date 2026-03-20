@@ -75,11 +75,11 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
         let mut last_hart = Instant::now();
         while _running.load(Ordering::Relaxed) {
             let _now = Instant::now();
-            if _now.duration_since(last_hart).as_secs() > 60 {
+            if _now.duration_since(last_hart).as_secs() > 30 {
                 // 发送心跳
                 last_hart = _now;
                 _ = _soc.send(&hart_buf).await;
-                log::info!("hart to server.");
+                log::info!("send hart to server.");
             }
             match timeout(tokio::time::Duration::from_secs(1), soc_receiver.recv()).await {
                 Ok(_readr) => {
@@ -130,9 +130,9 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
         while _running.load(Ordering::Relaxed) {
             let mut buf = BytesMut::with_capacity(4096);
             let _now = Instant::now();
-            if _now.duration_since(last_hart).as_secs() > 60 * 3 {
-                // 超过2分钟未收到回包 发送info包重新注册
-                log::info!("3 min no back.");
+            if _now.duration_since(last_hart).as_secs() > 60 * 5 {
+                // 超过5分钟未收到任何包，断线重连
+                log::info!("5 min no response, reconnecting...");
                 _running.store(false, Ordering::Relaxed);
                 return dev_sender;
             }
@@ -150,13 +150,17 @@ pub async fn forever(bind: SocketAddr, peer: SocketAddr, tun_ip: Ipv4Addr, cfg: 
                         }
                         bvcommon::TYPE_RST => {
                             // reset包
+                            log::info!("recv rst, resend info.");
                             let _ = _soc.send(&_info).await;
+                            last_hart = Instant::now(); // 重置心跳时间
                         }
                         bvcommon::TYPE_IPV4 => {
                             // ipv4包
                             if alen < 7 {
                                 continue;
                             }
+                            // 收到任何服务器数据包都更新心跳时间
+                            last_hart = Instant::now();
                             let plen = u16::from_be_bytes([buf[alen - 3], buf[alen - 2]]);
                             unsafe {
                                 buf.set_len(plen as usize);
