@@ -9,16 +9,20 @@ use treebitmap::IpLookupTable; // 使用 ChaCha20-Poly1305 实现
 
 use crate::{buffer::PBuffer, config::{Config, MetaInfo}, NONCE};
 
+// 用于存储废弃的sender，防止旧任务向新client发送数据
+type DeadSenders = Arc<RwLock<HashMap<IpAddr, mpsc::Sender<Bytes>>>>;
+
 /**
  * bind: 绑定地址
  * onece: 是否一次性连接
  */
 pub async fn forever(
-    bind: SocketAddr, 
+    bind: SocketAddr,
     cfg: Config,
-    onece: bool, 
+    onece: bool,
     customer_sender_map: Arc<RwLock<HashMap<IpAddr, (SocketAddr, Instant, mpsc::Sender<Bytes>, MetaInfo)>>>,
     iptables: Arc<RwLock<IpLookupTable<Ipv4Addr, Ipv4Addr>>>,
+    dead_senders: DeadSenders,
 ) {
     let running = Arc::new(AtomicBool::new(true));
     // 1. 初始化密钥和 nonce（随机数）
@@ -94,7 +98,7 @@ pub async fn forever(
                     continue;
                 }
                 buf = pb.into_buffer();
-                
+
                 // 重置客户端
                 let (sender, mut receiver) = mpsc::channel::<Bytes>(100);
                 if let Ok(meta_info) = serde_yaml::from_slice::<MetaInfo>(&buf) {
@@ -105,7 +109,11 @@ pub async fn forever(
                             m.insert(*ip, *masklen as u32, src);
                         }
                     }
-                    let old = customer_sender_map.write().await.insert(IpAddr::V4(src), (addr, Instant::now(), sender, meta_info));
+                    // 先保存旧sender到dead_senders，防止旧任务向新client发送数据
+                    if let Some((_, _, old_sender, _)) = customer_sender_map.read().await.get(&IpAddr::V4(src)) {
+                        dead_senders.write().await.insert(IpAddr::V4(src), old_sender.clone());
+                    }
+                    let old = customer_sender_map.write().await.insert(IpAddr::V4(src), (addr, Instant::now(), sender.clone(), meta_info));
                     if let Some(_) = old {
                         log::info!("{} break old client {}", line!(), src);
                     }
@@ -116,9 +124,18 @@ pub async fn forever(
                 let mut _cipher = cipher.clone();
                 let mut _running = running.clone();
                 let _customer_sender_map = customer_sender_map.clone();
+                let _dead_senders = dead_senders.clone();
+                let my_sender = sender.clone();
                 tokio::spawn(async move {
                     // 接收数据包
                     loop {
+                        // 检查自己是否已经被标记为dead（client重连了）
+                        if let Ok(dead) = _dead_senders.try_read() {
+                            if dead.get(&IpAddr::V4(src)).map_or(false, |s| s.same_channel(&my_sender)) {
+                                log::info!("{} client reconnected, stop old task", line!());
+                                return;
+                            }
+                        }
                         let buf = match receiver.recv().await {
                             Some(_buf) => _buf,
                             None => {
