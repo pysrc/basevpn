@@ -107,8 +107,41 @@ struct Args {
 
 const MTU: usize = 1400;
 
+#[cfg(target_os = "windows")]
+fn disable_quick_edit() {
+    // Windows API constants
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_INSERT_MODE: u32 = 0x0020;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() {
+            return;
+        }
+
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            // 禁用快速编辑模式和插入模式
+            let new_mode = mode & !(ENABLE_QUICK_EDIT_MODE | ENABLE_INSERT_MODE);
+            let _ = SetConsoleMode(handle, new_mode);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // 在Windows上禁用控制台快速编辑模式，防止点击控制台时程序暂停
+    #[cfg(target_os = "windows")]
+    disable_quick_edit();
+
     simple_logger::init_with_level(log::Level::Info).unwrap();
     let args = Args::parse();
     let cfg = config::Config::from_file(&args.config);
