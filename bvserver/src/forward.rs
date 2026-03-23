@@ -127,6 +127,9 @@ pub async fn forever(
                             tokio::select! {
                                 _ = _cancel_token.cancelled() => {
                                     log::info!("{} client reconnected, stop old task", line!());
+                                    if onece {
+                                        _running.store(false, Ordering::Relaxed);
+                                    }
                                     return;
                                 }
                                 Some(buf) = receiver.recv() => {
