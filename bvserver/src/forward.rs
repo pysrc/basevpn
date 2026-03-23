@@ -2,15 +2,13 @@ use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::{atom
 
 use bytes::{Bytes, BytesMut};
 use tokio::{net::UdpSocket, sync::{mpsc::{self, error::TrySendError}, RwLock}, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 use chacha20poly1305::aead::{AeadMutInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use treebitmap::IpLookupTable; // 使用 ChaCha20-Poly1305 实现
 
 use crate::{buffer::PBuffer, config::{Config, MetaInfo}, NONCE};
-
-// 用于存储废弃的sender，防止旧任务向新client发送数据
-type DeadSenders = Arc<RwLock<HashMap<IpAddr, mpsc::Sender<Bytes>>>>;
 
 /**
  * bind: 绑定地址
@@ -20,9 +18,8 @@ pub async fn forever(
     bind: SocketAddr,
     cfg: Config,
     onece: bool,
-    customer_sender_map: Arc<RwLock<HashMap<IpAddr, (SocketAddr, Instant, mpsc::Sender<Bytes>, MetaInfo)>>>,
+    customer_sender_map: Arc<RwLock<HashMap<IpAddr, (SocketAddr, Instant, mpsc::Sender<Bytes>, MetaInfo, CancellationToken)>>>,
     iptables: Arc<RwLock<IpLookupTable<Ipv4Addr, Ipv4Addr>>>,
-    dead_senders: DeadSenders,
 ) {
     let running = Arc::new(AtomicBool::new(true));
     // 1. 初始化密钥和 nonce（随机数）
@@ -64,7 +61,7 @@ pub async fn forever(
                 // 更新心跳时间
                 log::info!("hart [{}].", src);
                 match customer_sender_map.write().await.get_mut(&IpAddr::V4(src)) {
-                    Some((_org_addr, _t, _, _)) => {
+                    Some((_org_addr, _t, _, _, _)) => {
                         *_t = Instant::now();
                         if _org_addr != &addr {
                             // 地址发生变化
@@ -109,74 +106,71 @@ pub async fn forever(
                             m.insert(*ip, *masklen as u32, src);
                         }
                     }
-                    // 先保存旧sender到dead_senders，防止旧任务向新client发送数据
-                    if let Some((_, _, old_sender, _)) = customer_sender_map.read().await.get(&IpAddr::V4(src)) {
-                        dead_senders.write().await.insert(IpAddr::V4(src), old_sender.clone());
+                    // 取消旧任务的CancellationToken
+                    if let Some((_, _, _, _, old_token)) = customer_sender_map.read().await.get(&IpAddr::V4(src)) {
+                        old_token.cancel();
                     }
-                    let old = customer_sender_map.write().await.insert(IpAddr::V4(src), (addr, Instant::now(), sender.clone(), meta_info));
+                    let cancel_token = CancellationToken::new();
+                    let old = customer_sender_map.write().await.insert(IpAddr::V4(src), (addr, Instant::now(), sender.clone(), meta_info, cancel_token.clone()));
                     if let Some(_) = old {
                         log::info!("{} break old client {}", line!(), src);
                     }
-                } else {
-                    continue;
-                }
-                let _soc = soc.clone();
-                let mut _cipher = cipher.clone();
-                let mut _running = running.clone();
-                let _customer_sender_map = customer_sender_map.clone();
-                let _dead_senders = dead_senders.clone();
-                let my_sender = sender.clone();
-                tokio::spawn(async move {
-                    // 接收数据包
-                    loop {
-                        // 检查自己是否已经被标记为dead（client重连了）
-                        if let Ok(dead) = _dead_senders.try_read() {
-                            if dead.get(&IpAddr::V4(src)).map_or(false, |s| s.same_channel(&my_sender)) {
-                                log::info!("{} client reconnected, stop old task", line!());
-                                return;
-                            }
-                        }
-                        let buf = match receiver.recv().await {
-                            Some(_buf) => _buf,
-                            None => {
-                                log::info!("{} close stream.", line!());
-                                if onece {
-                                    _running.store(false, Ordering::Relaxed);
+                    let _soc = soc.clone();
+                    let mut _cipher = cipher.clone();
+                    let mut _running = running.clone();
+                    let _customer_sender_map = customer_sender_map.clone();
+                    let _cancel_token = cancel_token.clone();
+                    tokio::spawn(async move {
+                        // 接收数据包
+                        loop {
+                            // 使用tokio::select监听取消信号和数据接收
+                            tokio::select! {
+                                _ = _cancel_token.cancelled() => {
+                                    log::info!("{} client reconnected, stop old task", line!());
+                                    return;
                                 }
-                                return;
-                            }
-                        };
-                        // 拿最新地址
-                        if let Ok(x) = _customer_sender_map.try_read() {
-                            match x.get(&IpAddr::V4(src)) {
-                                Some((_addr, _, _, _)) => {
-                                    match _soc.try_send_to(&buf, *_addr) {
-                                        Ok(_) => {}
-                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {
-                                            // Writable false positive.
-                                            log::info!("{} continue stream -> {}", line!(), e);
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            log::info!("{} close stream -> {}", line!(), e);
-                                            if onece {
-                                                _running.store(false, Ordering::Relaxed);
+                                Some(buf) = receiver.recv() => {
+                                    // 拿最新地址
+                                    if let Ok(x) = _customer_sender_map.try_read() {
+                                        match x.get(&IpAddr::V4(src)) {
+                                            Some((_addr, _, _, _, _)) => {
+                                                match _soc.try_send_to(&buf, *_addr) {
+                                                    Ok(_) => {}
+                                                    Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {
+                                                        // Writable false positive.
+                                                        log::info!("{} continue stream -> {}", line!(), e);
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        log::info!("{} close stream -> {}", line!(), e);
+                                                        if onece {
+                                                            _running.store(false, Ordering::Relaxed);
+                                                        }
+                                                        return;
+                                                    }
+                                                }
                                             }
-                                            return;
+                                            None => {
+                                                log::info!("{} close stream", line!());
+                                                if onece {
+                                                    _running.store(false, Ordering::Relaxed);
+                                                }
+                                                return;
+                                            }
                                         }
                                     }
                                 }
-                                None => {
-                                    log::info!("{} close stream", line!());
+                                else => {
+                                    log::info!("{} close stream.", line!());
                                     if onece {
                                         _running.store(false, Ordering::Relaxed);
                                     }
-                                    return;   
+                                    return;
                                 }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
             bvcommon::TYPE_IPV4 => {
                 // ipv4信息包
@@ -191,7 +185,7 @@ pub async fn forever(
                                 let to = IpAddr::V4(*toaddr);
                                 // log::info!("{} send to {} by {}", line!(), dst, to);
                                 match customer_sender_map.read().await.get(&to) {
-                                    Some((_, _, c, _)) => {
+                                    Some((_, _, c, _, _)) => {
                                         match c.try_send(buf.freeze()) {
                                             Ok(()) => {}
                                             Err(TrySendError::Closed(_)) => {

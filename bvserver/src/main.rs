@@ -7,6 +7,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::Parser;
 use config::MetaInfo;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc::{self, error::TrySendError}, RwLock}, time};
+use tokio_util::sync::CancellationToken;
 use treebitmap::IpLookupTable;
 #[cfg(target_os = "windows")]
 use tun::AbstractDevice;
@@ -239,11 +240,9 @@ async fn main() {
     // 主通道
     let (main_sender, mut main_receiver) = mpsc::channel::<Bytes>(100);
     // 客户端通道
-    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>, MetaInfo)>::new()));
-    // 废弃的sender映射，用于处理client重连时旧任务的问题
-    let dead_senders = Arc::new(RwLock::new(HashMap::<IpAddr, mpsc::Sender<Bytes>>::new()));
+    let customer_sender_map = Arc::new(RwLock::new(HashMap::<IpAddr, (SocketAddr, time::Instant, mpsc::Sender<Bytes>, MetaInfo, CancellationToken)>::new()));
     // 放入本机信息
-    customer_sender_map.write().await.insert(IpAddr::V4(tun_ip), (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), time::Instant::now(), main_sender, MetaInfo{in_routes4}));
+    customer_sender_map.write().await.insert(IpAddr::V4(tun_ip), (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), time::Instant::now(), main_sender, MetaInfo{in_routes4}, CancellationToken::new()));
 
     let _customer_sender_map = customer_sender_map.clone();
     let mut _cipher = cipher.clone();
@@ -284,7 +283,7 @@ async fn main() {
                             let to = IpAddr::V4(*toaddr);
                             // log::info!("{} send to {} by {}", line!(), dst, to);
                             match _customer_sender_map.read().await.get(&to) {
-                                Some((_, _, c, _)) => {
+                                Some((_, _, c, _, _)) => {
                                     match c.try_send(buf.freeze()) {
                                         Ok(()) => {}
                                         Err(TrySendError::Closed(_)) => {
@@ -341,19 +340,20 @@ async fn main() {
 
     let _customer_sender_map = customer_sender_map.clone();
     let _iptables = iptables.clone();
-    let dead_senders_for_cleanup = dead_senders.clone();
     tokio::spawn(async move {
         // 检查源ip是否10分钟内没来数据了，是的话剔除会话列表
         loop {
             time::sleep(time::Duration::from_secs(60 * 10)).await;
             let _now = time::Instant::now();
             let mut _m = _iptables.write().await;
-            _customer_sender_map.write().await.retain(|ip, (_, t, _, _meta_info) | {
+            _customer_sender_map.write().await.retain(|ip, (_, t, _, _meta_info, cancel_token) | {
                 if ip == &tun_ip {
                     true
                 } else {
                     let res = _now.duration_since(*t).as_secs() < 600;
                     if !res {
+                        // 取消旧任务
+                        cancel_token.cancel();
                         // 移除客户端，同时移除iptables
                         for (ip, prefix) in &_meta_info.in_routes4 {
                             if let Some(addr) = _m.remove(*ip, *prefix as u32) {
@@ -364,9 +364,6 @@ async fn main() {
                     res
                 }
             });
-            // 同步清理dead_senders
-            let active_ips: Vec<IpAddr> = _customer_sender_map.read().await.keys().cloned().collect();
-            dead_senders_for_cleanup.write().await.retain(|ip, _| active_ips.contains(ip));
             log::info!("sender map retain {}", _customer_sender_map.read().await.len());
         }
     });
@@ -377,10 +374,8 @@ async fn main() {
     let cfg1 = cfg.clone();
     let _customer_sender_map = customer_sender_map.clone();
     let _iptables = iptables.clone();
-    let dead_senders_for_relay = dead_senders.clone();
     tokio::spawn(async move {
         let mut dly = delay::Delay::new();
-        let _dead_senders = dead_senders_for_relay.clone();
         match rcfg {
             Some(rcfg) => {
                 log::info!("start relay mode.");
@@ -394,11 +389,10 @@ async fn main() {
                     let cfgc = cfg1.clone();
                     let __customer_sender_map = _customer_sender_map.clone();
                     let __iptables = _iptables.clone();
-                    let __dead_senders = _dead_senders.clone();
                     tokio::spawn(async move {
                         match peer_info {
                             Some((_bind, _)) => {
-                                forward::forever(_bind, cfgc, true, __customer_sender_map, __iptables, __dead_senders).await;
+                                forward::forever(_bind, cfgc, true, __customer_sender_map, __iptables).await;
                             }
                             None => {
                                 log::info!("RELAY DOWN.");
@@ -415,7 +409,6 @@ async fn main() {
 
     // 直连模式
     let dcfg = cfg.direct_config.clone();
-    let _dead_senders = dead_senders.clone();
     tokio::spawn(async move {
         match dcfg {
             Some(dcfg) => {
@@ -423,7 +416,7 @@ async fn main() {
                 log::info!("start direct mode.");
                 let _customer_sender_map = customer_sender_map.clone();
                 let _iptables = iptables.clone();
-                forward::forever(bind, cfg, false, _customer_sender_map, _iptables, _dead_senders).await;
+                forward::forever(bind, cfg, false, _customer_sender_map, _iptables).await;
             }
             None => {
                 log::info!("no direct config");

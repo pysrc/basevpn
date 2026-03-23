@@ -11,6 +11,7 @@ serde_yaml = { workspace = true }
 sha1 = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 clap = { workspace = true }
 
